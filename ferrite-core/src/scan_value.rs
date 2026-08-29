@@ -4,6 +4,8 @@
 
 use std::cmp::Ordering;
 
+use serde::{Deserialize, Serialize};
+
 /// A value the scan engine can search for or compare — the numeric types in
 /// v1's scan matrix (see the vault's `v1-scope.md`).
 ///
@@ -11,7 +13,7 @@ use std::cmp::Ordering;
 /// it's a substring search over arbitrary-length byte patterns, mechanically
 /// different from a fixed-width numeric compare, and doesn't belong
 /// pretending to be a numeric value.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ScanValue {
     I8(i8),
     I16(i16),

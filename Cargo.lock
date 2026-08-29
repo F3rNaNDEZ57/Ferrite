@@ -950,6 +950,8 @@ name = "ferrite-core"
 version = "0.1.0"
 dependencies = [
  "escargot",
+ "serde",
+ "serde_json",
  "sysinfo",
  "windows",
 ]
