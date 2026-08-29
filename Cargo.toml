@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ferrite-core", "ferrite-gui"]
+members = ["ferrite-core", "ferrite-gui", "ferrite-victim"]
 
 [workspace.package]
 version = "0.1.0"
