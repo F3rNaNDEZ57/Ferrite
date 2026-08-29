@@ -131,7 +131,7 @@ fn extract_from_hbitmap(hbitmap: HBITMAP) -> Option<IconRgba> {
 
     // GetDIBits returns BGRA; egui::ColorImage::from_rgba_unmultiplied
     // expects RGBA - swap B and R per pixel.
-    for pixel in buffer.chunks_exact_mut(4) {
+    for pixel in buffer.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
 
