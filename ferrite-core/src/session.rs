@@ -4,13 +4,55 @@
 //! handle and closes it automatically on drop (RAII); it is intentionally
 //! not `Clone`. See the concurrency model in the vault's `v1-plan.md`.
 
+use core::ffi::c_void;
+
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE,
 };
+use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 use windows::core::HRESULT;
+
+/// Why a read or write against attached process memory failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryError {
+    /// The OS refused the read/write outright — e.g. the address isn't
+    /// mapped, or isn't mapped with the needed protection. Carries the raw
+    /// Win32 error code.
+    Os(u32),
+    /// The OS reported success but transferred fewer bytes than requested,
+    /// without an error code explaining why (can happen at the edge of a
+    /// mapped region).
+    Partial {
+        requested: usize,
+        transferred: usize,
+    },
+}
+
+impl std::fmt::Display for MemoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Os(code) => write!(f, "OS error {code}"),
+            Self::Partial {
+                requested,
+                transferred,
+            } => write!(
+                f,
+                "only {transferred} of {requested} requested bytes were transferred"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MemoryError {}
+
+impl From<windows::core::Error> for MemoryError {
+    fn from(err: windows::core::Error) -> Self {
+        Self::Os(err.code().0 as u32)
+    }
+}
 
 /// Why [`ProcessSession::attach`] failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +123,57 @@ impl ProcessSession {
     /// The PID this session is attached to.
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Reads `len` bytes from the attached process's memory at `address`.
+    pub fn read_bytes(&self, address: usize, len: usize) -> Result<Vec<u8>, MemoryError> {
+        let mut buffer = vec![0u8; len];
+        let mut bytes_read = 0usize;
+
+        // SAFETY: `buffer` is a valid, uniquely-owned allocation of exactly
+        // `len` bytes for the duration of this call.
+        unsafe {
+            ReadProcessMemory(
+                self.handle,
+                address as *const c_void,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                len,
+                Some(&raw mut bytes_read),
+            )
+        }?;
+
+        if bytes_read != len {
+            return Err(MemoryError::Partial {
+                requested: len,
+                transferred: bytes_read,
+            });
+        }
+        Ok(buffer)
+    }
+
+    /// Writes `data` to the attached process's memory at `address`.
+    pub fn write_bytes(&self, address: usize, data: &[u8]) -> Result<(), MemoryError> {
+        let mut bytes_written = 0usize;
+
+        // SAFETY: `data` is valid for reads of `data.len()` bytes for the
+        // duration of this call; we only pass it as the source buffer.
+        unsafe {
+            WriteProcessMemory(
+                self.handle,
+                address as *const c_void,
+                data.as_ptr().cast::<c_void>(),
+                data.len(),
+                Some(&raw mut bytes_written),
+            )
+        }?;
+
+        if bytes_written != data.len() {
+            return Err(MemoryError::Partial {
+                requested: data.len(),
+                transferred: bytes_written,
+            });
+        }
+        Ok(())
     }
 }
 

@@ -10,4 +10,4 @@ pub mod process;
 pub mod session;
 
 pub use process::{ProcessInfo, list_processes};
-pub use session::{AttachError, ProcessSession};
+pub use session::{AttachError, MemoryError, ProcessSession};
