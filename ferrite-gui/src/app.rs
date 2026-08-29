@@ -1,12 +1,14 @@
 //! The Ferrite application: process picker, scan panel, and results table.
 
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use ferrite_core::{
-    AobFilter, AobMatch, AttachError, ProcessInfo, ProcessSession, ScanFilter, ScanMatch,
-    ScanOptions, ScanValue, first_scan_aob, first_scan_exact, format_pattern, next_scan,
-    next_scan_aob, parse_hex_pattern,
+    AobFilter, AobMatch, AttachError, DEFAULT_FREEZE_INTERVAL, FreezeHandle, ProcessInfo,
+    ProcessSession, ScanFilter, ScanMatch, ScanOptions, ScanValue, first_scan_aob,
+    first_scan_exact, format_pattern, next_scan, next_scan_aob, parse_hex_pattern,
 };
 
 /// How many result rows the table actually renders. Independent of
@@ -95,13 +97,19 @@ enum Results {
 }
 
 /// An active attach: the session plus everything scoped to it. Dropping this
-/// (via Detach) closes the process handle, per `ProcessSession`'s RAII Drop.
+/// (via Detach) closes the process handle, per `ProcessSession`'s RAII Drop -
+/// and, per `FreezeHandle`'s Drop, stops and joins the freeze thread first.
 struct Attached {
-    session: ProcessSession,
+    session: Arc<ProcessSession>,
+    freeze: FreezeHandle,
     process_name: String,
     pid: u32,
     results: Option<Results>,
     capped: bool,
+    /// Addresses currently checked in the results table, for "Set Value" to
+    /// act on. Keyed by address rather than table row, since rows move
+    /// around under filtering/live-refresh but an address is stable.
+    selected: HashSet<usize>,
     last_refresh: Instant,
 }
 
@@ -109,11 +117,17 @@ pub struct FerriteApp {
     processes: Vec<ProcessInfo>,
     attached: Option<Attached>,
     attach_error: Option<String>,
+    /// Set when a freeze thread detects its target process exited, and
+    /// survives the resulting auto-detach so the user actually sees why the
+    /// attach went away instead of it just silently disappearing.
+    process_exited_message: Option<String>,
     value_type: ValueTypeChoice,
     input_text: String,
     input_error: Option<String>,
     filter: ScanFilter,
     aob_filter: AobFilter,
+    edit_input_text: String,
+    edit_input_error: Option<String>,
 }
 
 impl FerriteApp {
@@ -122,26 +136,34 @@ impl FerriteApp {
             processes: sorted_processes(),
             attached: None,
             attach_error: None,
+            process_exited_message: None,
             value_type: ValueTypeChoice::I32,
             input_text: String::new(),
             input_error: None,
             filter: ScanFilter::Changed,
             aob_filter: AobFilter::Changed,
+            edit_input_text: String::new(),
+            edit_input_error: None,
         }
     }
 
     fn attach(&mut self, process: &ProcessInfo) {
         match ProcessSession::attach(process.pid) {
             Ok(session) => {
+                let session = Arc::new(session);
+                let freeze = session.start_freeze_thread(DEFAULT_FREEZE_INTERVAL);
                 self.attached = Some(Attached {
                     session,
+                    freeze,
                     process_name: process.name.clone(),
                     pid: process.pid,
                     results: None,
                     capped: false,
+                    selected: HashSet::new(),
                     last_refresh: Instant::now(),
                 });
                 self.attach_error = None;
+                self.process_exited_message = None;
             }
             Err(err) => {
                 self.attach_error = Some(match err {
@@ -153,6 +175,24 @@ impl FerriteApp {
                 });
             }
         }
+    }
+
+    /// If the freeze thread has detected that the target process exited,
+    /// surfaces that and force-detaches - a stale, unwritable session isn't
+    /// useful to keep around, and its results/edit controls would silently
+    /// do nothing if left attached.
+    fn check_target_exited(&mut self) {
+        let Some(attached) = &self.attached else {
+            return;
+        };
+        if !attached.freeze.target_exited() {
+            return;
+        }
+        self.process_exited_message = Some(format!(
+            "{} (pid {}) exited while frozen values were active.",
+            attached.process_name, attached.pid
+        ));
+        self.attached = None; // Drop closes the handle and joins the freeze thread.
     }
 
     /// Re-reads each displayed row's current bytes from the target process,
@@ -213,6 +253,9 @@ impl FerriteApp {
         if let Some(err) = &self.attach_error {
             ui.colored_label(egui::Color32::RED, err);
         }
+        if let Some(msg) = &self.process_exited_message {
+            ui.colored_label(egui::Color32::RED, msg);
+        }
 
         if self.attached.is_none() {
             ui.separator();
@@ -266,9 +309,12 @@ impl FerriteApp {
             if self.value_type != previous_type {
                 // Switching types mid-session invalidates the current
                 // results (a filter for one kind is meaningless applied to
-                // the other) - clear rather than let them go stale.
+                // the other) - clear rather than let them go stale, and
+                // drop selections along with them (frozen entries are left
+                // alone - they're independent of what's currently shown).
                 attached.results = None;
                 attached.capped = false;
+                attached.selected.clear();
             }
 
             let is_aob = self.value_type == ValueTypeChoice::Aob;
@@ -304,6 +350,7 @@ impl FerriteApp {
             if attached.results.is_some() && ui.button("New Scan").clicked() {
                 attached.results = None;
                 attached.capped = false;
+                attached.selected.clear();
             }
         });
 
@@ -361,28 +408,73 @@ impl FerriteApp {
         }
     }
 
-    fn show_results_table(&self, ui: &mut egui::Ui) {
-        let Some(attached) = &self.attached else {
+    fn show_results_table(&mut self, ui: &mut egui::Ui) {
+        let Some(attached) = &mut self.attached else {
             return;
         };
-        let Some(results) = &attached.results else {
+        if attached.results.is_none() {
+            return;
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("New value:");
+            ui.text_edit_singleline(&mut self.edit_input_text);
+
+            let selected_count = attached.selected.len();
+            let set_clicked = ui
+                .add_enabled(selected_count > 0, egui::Button::new("Set Value"))
+                .clicked();
+            if set_clicked {
+                match parse_write_bytes(self.value_type, &self.edit_input_text) {
+                    Ok(bytes) => {
+                        for &address in &attached.selected {
+                            // A single address failing to write (e.g. the
+                            // page became unwritable) shouldn't stop the
+                            // rest of the batch.
+                            let _ = attached.session.write_bytes(address, &bytes);
+                        }
+                        self.edit_input_error = None;
+                    }
+                    Err(err) => self.edit_input_error = Some(err),
+                }
+            }
+            ui.label(format!("({selected_count} selected)"));
+        });
+        if let Some(err) = &self.edit_input_error {
+            ui.colored_label(egui::Color32::RED, err);
+        }
+
+        let Attached {
+            freeze,
+            results,
+            selected,
+            capped,
+            ..
+        } = attached;
+        let Some(results) = results else {
             return;
         };
 
-        ui.separator();
         match results {
             Results::Numeric(matches) => {
-                let shown = render_result_summary(ui, matches.len(), attached.capped);
+                let shown = render_result_summary(ui, matches.len(), *capped);
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui::Grid::new("results_table")
                         .striped(true)
-                        .num_columns(2)
+                        .num_columns(4)
                         .show(ui, |ui| {
+                            ui.strong("");
+                            ui.strong("Frozen");
                             ui.strong("Address");
                             ui.strong("Value");
                             ui.end_row();
 
                             for m in matches.iter().take(shown) {
+                                show_selection_checkbox(ui, selected, m.address);
+                                show_frozen_checkbox(ui, freeze, m.address, || {
+                                    m.value.to_le_bytes()
+                                });
                                 ui.label(format!("{:#x}", m.address));
                                 ui.label(format_value(m.value));
                                 ui.end_row();
@@ -391,17 +483,21 @@ impl FerriteApp {
                 });
             }
             Results::Aob(matches) => {
-                let shown = render_result_summary(ui, matches.len(), attached.capped);
+                let shown = render_result_summary(ui, matches.len(), *capped);
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui::Grid::new("results_table")
                         .striped(true)
-                        .num_columns(2)
+                        .num_columns(4)
                         .show(ui, |ui| {
+                            ui.strong("");
+                            ui.strong("Frozen");
                             ui.strong("Address");
                             ui.strong("Bytes");
                             ui.end_row();
 
                             for m in matches.iter().take(shown) {
+                                show_selection_checkbox(ui, selected, m.address);
+                                show_frozen_checkbox(ui, freeze, m.address, || m.bytes.clone());
                                 ui.label(format!("{:#x}", m.address));
                                 ui.label(format_pattern(&m.bytes));
                                 ui.end_row();
@@ -410,6 +506,50 @@ impl FerriteApp {
                 });
             }
         }
+    }
+}
+
+/// Renders the leftmost "select this row" checkbox and keeps `selected` in
+/// sync with it.
+fn show_selection_checkbox(ui: &mut egui::Ui, selected: &mut HashSet<usize>, address: usize) {
+    let mut is_selected = selected.contains(&address);
+    if ui.checkbox(&mut is_selected, "").changed() {
+        if is_selected {
+            selected.insert(address);
+        } else {
+            selected.remove(&address);
+        }
+    }
+}
+
+/// Renders the "Frozen" checkbox and toggles the freeze thread's entry for
+/// `address` to match. `current_bytes` is called only when the checkbox is
+/// freshly checked - freezing pins whatever the row is currently showing.
+fn show_frozen_checkbox(
+    ui: &mut egui::Ui,
+    freeze: &FreezeHandle,
+    address: usize,
+    current_bytes: impl FnOnce() -> Vec<u8>,
+) {
+    let mut is_frozen = freeze.is_frozen(address);
+    if ui.checkbox(&mut is_frozen, "").changed() {
+        if is_frozen {
+            freeze.freeze(address, current_bytes());
+        } else {
+            freeze.unfreeze(address);
+        }
+    }
+}
+
+/// Parses the edit box's text into raw bytes to write: a hex pattern for
+/// `Aob`, or a numeric value's little-endian bytes otherwise. Shared by
+/// "Set Value" - `First Scan` has its own parse step because it also needs
+/// the typed `ScanValue`/pattern, not just bytes.
+fn parse_write_bytes(value_type: ValueTypeChoice, text: &str) -> Result<Vec<u8>, String> {
+    if value_type == ValueTypeChoice::Aob {
+        parse_hex_pattern(text)
+    } else {
+        value_type.parse(text).map(ScanValue::to_le_bytes)
     }
 }
 
@@ -452,6 +592,7 @@ fn sorted_processes() -> Vec<ProcessInfo> {
 
 impl eframe::App for FerriteApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.check_target_exited();
         self.refresh_live_values();
         if self.attached.is_some() {
             // eframe only repaints reactively (on input) by default - an
