@@ -125,6 +125,14 @@ impl ProcessSession {
         self.pid
     }
 
+    /// The raw handle, for other `ferrite-core` modules (e.g. region
+    /// enumeration) that need to call Win32 APIs this struct doesn't wrap
+    /// itself. Deliberately not `pub` — callers outside this crate only ever
+    /// see `ProcessSession`'s own methods.
+    pub(crate) fn handle(&self) -> HANDLE {
+        self.handle
+    }
+
     /// Reads `len` bytes from the attached process's memory at `address`.
     pub fn read_bytes(&self, address: usize, len: usize) -> Result<Vec<u8>, MemoryError> {
         let mut buffer = vec![0u8; len];

@@ -7,7 +7,9 @@
 //! for the full v1 scope and build plan.
 
 pub mod process;
+pub mod regions;
 pub mod session;
 
 pub use process::{ProcessInfo, list_processes};
+pub use regions::MemoryRegion;
 pub use session::{AttachError, MemoryError, ProcessSession};
