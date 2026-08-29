@@ -9,6 +9,7 @@
 pub mod aob;
 pub mod ct_import;
 pub mod freeze;
+pub mod icon;
 pub mod modules;
 pub mod pointer;
 pub mod process;
@@ -24,6 +25,7 @@ pub use aob::{
 };
 pub use ct_import::{CtImportError, ImportReport, SkippedEntry, import_ct_file, import_ct_xml};
 pub use freeze::{DEFAULT_FREEZE_INTERVAL, FreezeHandle};
+pub use icon::{IconRgba, extract_icon_rgba};
 pub use modules::{ModuleError, ModuleInfo, list_modules, module_base};
 pub use pointer::resolve_pointer;
 pub use process::{ProcessInfo, list_processes};

@@ -4,6 +4,8 @@
 //! [`ProcessInfo`] at the boundary so `sysinfo`'s types don't leak into the
 //! rest of `ferrite-core`'s public API.
 
+use std::path::PathBuf;
+
 use sysinfo::{ProcessesToUpdate, System};
 
 /// A running process, as shown in the process picker.
@@ -11,6 +13,12 @@ use sysinfo::{ProcessesToUpdate, System};
 pub struct ProcessInfo {
     pub pid: u32,
     pub name: String,
+    /// The process's own executable path, if known - `None` for
+    /// pseudo-processes with no backing file (`[System Process]`,
+    /// `Registry`, `Secure System`) or when access is denied. Used to look
+    /// up the process's icon (see `crate::icon`); nothing in `ferrite-core`
+    /// itself needs it.
+    pub exe: Option<PathBuf>,
 }
 
 /// Lists currently running processes.
@@ -27,6 +35,7 @@ pub fn list_processes() -> Vec<ProcessInfo> {
         .map(|process| ProcessInfo {
             pid: process.pid().as_u32(),
             name: process.name().to_string_lossy().into_owned(),
+            exe: process.exe().map(|path| path.to_path_buf()),
         })
         .collect()
 }
