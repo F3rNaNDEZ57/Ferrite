@@ -202,6 +202,14 @@ impl FerriteApp {
     /// freed) is left showing its last known value rather than removed -
     /// unlike a scan filter, a live-refresh miss isn't a judgment that the
     /// row no longer matches.
+    ///
+    /// Also the general process-exit check, on the same throttle:
+    /// `check_target_exited` only learns about an exit via the freeze
+    /// thread, so it stays silent for a session with nothing frozen (an
+    /// attach with no scan yet, or a scan with nothing checked). This method
+    /// already touches the session on a timer regardless of freeze state,
+    /// so it's the natural place to close that gap with one extra cheap
+    /// call - see the "Known scope limit" note in the vault's `v1-plan.md`.
     fn refresh_live_values(&mut self) {
         let Some(attached) = &mut self.attached else {
             return;
@@ -210,6 +218,13 @@ impl FerriteApp {
             return;
         }
         attached.last_refresh = Instant::now();
+
+        if attached.session.has_exited() {
+            let message = format!("{} (pid {}) exited.", attached.process_name, attached.pid);
+            self.process_exited_message = Some(message);
+            self.attached = None; // Drop closes the handle and joins the freeze thread.
+            return;
+        }
 
         let Attached {
             session, results, ..

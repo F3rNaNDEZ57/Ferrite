@@ -151,8 +151,10 @@ impl ProcessSession {
     /// session's handle). `STILL_ACTIVE` means it's still running; anything
     /// else means it has exited. Used by the freeze thread to distinguish
     /// "the target process exited" from "one write to one now-invalid
-    /// address failed" before reporting the session as dead.
-    pub(crate) fn has_exited(&self) -> bool {
+    /// address failed" before reporting the session as dead, and by callers
+    /// (e.g. a GUI's polling loop) that want to detect exit independent of
+    /// whether anything is frozen.
+    pub fn has_exited(&self) -> bool {
         let mut exit_code = 0u32;
         // SAFETY: `self.handle` is a valid process handle and `exit_code`
         // is a valid, uniquely-owned `u32` for the duration of this call.
