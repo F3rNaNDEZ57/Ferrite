@@ -1,14 +1,17 @@
 //! The Ferrite application: process picker, scan panel, and results table.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use ferrite_core::{
-    AobFilter, AobMatch, AttachError, DEFAULT_FREEZE_INTERVAL, FreezeHandle, ProcessInfo,
-    ProcessSession, ScanFilter, ScanMatch, ScanOptions, ScanValue, first_scan_aob,
-    first_scan_exact, format_pattern, next_scan, next_scan_aob, parse_hex_pattern,
+    AddressExpr, AobFilter, AobMatch, AttachError, CheatEntry, DEFAULT_FREEZE_INTERVAL, EntryValue,
+    FreezeHandle, ProcessInfo, ProcessSession, ResolveError, ScanFilter, ScanMatch, ScanOptions,
+    ScanValue, first_scan_aob, first_scan_exact, format_pattern, load_table, next_scan,
+    next_scan_aob, parse_address_expr, parse_hex_pattern, parse_hex_usize, resolve_address,
+    save_table,
 };
 
 /// How many result rows the table actually renders. Independent of
@@ -78,6 +81,23 @@ impl ValueTypeChoice {
     }
 }
 
+/// Reinterprets freshly-read `bytes` as the same shape `previous` was -
+/// mirrors `ScanValue::from_le_bytes_like`'s "keep the type, take the new
+/// bits" contract for `EntryValue`'s extra `Bytes` variant too.
+fn reinterpret_entry_value(previous: &EntryValue, bytes: &[u8]) -> EntryValue {
+    match previous {
+        EntryValue::Scalar(v) => EntryValue::Scalar(v.from_le_bytes_like(bytes)),
+        EntryValue::Bytes(_) => EntryValue::Bytes(bytes.to_vec()),
+    }
+}
+
+fn format_entry_value(value: &EntryValue) -> String {
+    match value {
+        EntryValue::Scalar(v) => format_value(*v),
+        EntryValue::Bytes(bytes) => format_pattern(bytes),
+    }
+}
+
 fn format_value(value: ScanValue) -> String {
     match value {
         ScanValue::I8(v) => v.to_string(),
@@ -94,6 +114,39 @@ fn format_value(value: ScanValue) -> String {
 enum Results {
     Numeric(Vec<ScanMatch>),
     Aob(Vec<AobMatch>),
+}
+
+/// A saved-list row's live resolution state — GUI-only display state, never
+/// persisted (only the `CheatEntry` itself is saved/loaded). Recomputed each
+/// throttled refresh tick so the saved list always shows *some* status per
+/// entry, independent of whether a process is attached at all (see the
+/// vault's `v1-plan.md`: loading while detached, or attached to the wrong
+/// process, must never silently drop entries).
+#[derive(Clone)]
+enum RowStatus {
+    NotAttached,
+    Resolved,
+    ModuleNotFound(String),
+    Unreadable,
+}
+
+impl RowStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::NotAttached => "—".to_string(),
+            Self::Resolved => String::new(),
+            Self::ModuleNotFound(module) => format!("module {module:?} not found"),
+            Self::Unreadable => "unreadable".to_string(),
+        }
+    }
+}
+
+/// One row in the saved-list panel: the persisted [`CheatEntry`] plus its
+/// live, GUI-only resolution state.
+struct SavedRow {
+    entry: CheatEntry,
+    resolved_address: Option<usize>,
+    status: RowStatus,
 }
 
 /// An active attach: the session plus everything scoped to it. Dropping this
@@ -128,6 +181,16 @@ pub struct FerriteApp {
     aob_filter: AobFilter,
     edit_input_text: String,
     edit_input_error: Option<String>,
+    saved: Vec<SavedRow>,
+    last_saved_refresh: Instant,
+    manual_description: String,
+    manual_address_text: String,
+    manual_pointer_offset_text: String,
+    manual_value_type: ValueTypeChoice,
+    manual_value_text: String,
+    manual_add_error: Option<String>,
+    table_path_text: String,
+    table_status: Option<String>,
 }
 
 impl FerriteApp {
@@ -144,6 +207,16 @@ impl FerriteApp {
             aob_filter: AobFilter::Changed,
             edit_input_text: String::new(),
             edit_input_error: None,
+            saved: Vec::new(),
+            last_saved_refresh: Instant::now(),
+            manual_description: String::new(),
+            manual_address_text: String::new(),
+            manual_pointer_offset_text: String::new(),
+            manual_value_type: ValueTypeChoice::I32,
+            manual_value_text: String::new(),
+            manual_add_error: None,
+            table_path_text: String::new(),
+            table_status: None,
         }
     }
 
@@ -193,6 +266,71 @@ impl FerriteApp {
             attached.process_name, attached.pid
         ));
         self.attached = None; // Drop closes the handle and joins the freeze thread.
+        self.mark_saved_entries_unattached();
+    }
+
+    /// Resets every saved-list row's live status to `NotAttached` — called
+    /// whenever the active session goes away (Detach, exit detection),
+    /// since a stale "Resolved" status must not linger once there's no
+    /// session left to have resolved it against.
+    fn mark_saved_entries_unattached(&mut self) {
+        for row in &mut self.saved {
+            row.resolved_address = None;
+            row.status = RowStatus::NotAttached;
+        }
+    }
+
+    /// Re-resolves every saved entry's address against the attached
+    /// session, throttled like `refresh_live_values`. Runs independently of
+    /// whether a scan has ever happened - the saved list is its own thing,
+    /// not derived from scan results (see the vault's `v1-plan.md`).
+    fn refresh_saved_entries(&mut self) {
+        let Some(attached) = &self.attached else {
+            return;
+        };
+        if self.last_saved_refresh.elapsed() < LIVE_REFRESH_INTERVAL {
+            return;
+        }
+        self.last_saved_refresh = Instant::now();
+
+        for row in &mut self.saved {
+            let was_resolved = matches!(row.status, RowStatus::Resolved);
+            match resolve_address(&row.entry, &attached.session) {
+                Ok(address) => {
+                    row.resolved_address = Some(address);
+
+                    // Freezing pins to the *saved* value, not whatever's
+                    // currently in memory - do this once, right on the
+                    // transition into "resolved" (covers both "table loaded
+                    // while detached, attach happens later" and "loaded
+                    // while already attached"), before the live-read below
+                    // would otherwise overwrite it. See the vault's
+                    // `v1-plan.md`.
+                    if !was_resolved && row.entry.frozen && !attached.freeze.is_frozen(address) {
+                        attached
+                            .freeze
+                            .freeze(address, row.entry.value.to_le_bytes());
+                    }
+
+                    let len = row.entry.value.to_le_bytes().len();
+                    match attached.session.read_bytes(address, len) {
+                        Ok(bytes) => {
+                            row.entry.value = reinterpret_entry_value(&row.entry.value, &bytes);
+                            row.status = RowStatus::Resolved;
+                        }
+                        Err(_) => row.status = RowStatus::Unreadable,
+                    }
+                }
+                Err(ResolveError::ModuleNotFound(module)) => {
+                    row.resolved_address = None;
+                    row.status = RowStatus::ModuleNotFound(module);
+                }
+                Err(ResolveError::Memory(_)) => {
+                    row.resolved_address = None;
+                    row.status = RowStatus::Unreadable;
+                }
+            }
+        }
     }
 
     /// Re-reads each displayed row's current bytes from the target process,
@@ -223,6 +361,7 @@ impl FerriteApp {
             let message = format!("{} (pid {}) exited.", attached.process_name, attached.pid);
             self.process_exited_message = Some(message);
             self.attached = None; // Drop closes the handle and joins the freeze thread.
+            self.mark_saved_entries_unattached();
             return;
         }
 
@@ -261,6 +400,7 @@ impl FerriteApp {
                 ));
                 if ui.button("Detach").clicked() {
                     self.attached = None; // Drop closes the handle.
+                    self.mark_saved_entries_unattached();
                 }
             }
         });
@@ -279,6 +419,7 @@ impl FerriteApp {
             }
 
             egui::ScrollArea::vertical()
+                .id_salt("process_list_scroll")
                 .max_height(300.0)
                 .show(ui, |ui| {
                     egui::Grid::new("process_list")
@@ -478,54 +619,284 @@ impl FerriteApp {
             return;
         };
 
+        let mut to_promote: Option<SavedRow> = None;
+
         match results {
             Results::Numeric(matches) => {
                 let shown = render_result_summary(ui, matches.len(), *capped);
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::Grid::new("results_table")
-                        .striped(true)
-                        .num_columns(4)
-                        .show(ui, |ui| {
-                            ui.strong("");
-                            ui.strong("Frozen");
-                            ui.strong("Address");
-                            ui.strong("Value");
-                            ui.end_row();
-
-                            for m in matches.iter().take(shown) {
-                                show_selection_checkbox(ui, selected, m.address);
-                                show_frozen_checkbox(ui, freeze, m.address, || {
-                                    m.value.to_le_bytes()
-                                });
-                                ui.label(format!("{:#x}", m.address));
-                                ui.label(format_value(m.value));
+                egui::ScrollArea::vertical()
+                    .id_salt("results_table_scroll")
+                    .show(ui, |ui| {
+                        egui::Grid::new("results_table")
+                            .striped(true)
+                            .num_columns(5)
+                            .show(ui, |ui| {
+                                ui.strong("");
+                                ui.strong("Frozen");
+                                ui.strong("Address");
+                                ui.strong("Value");
+                                ui.strong("");
                                 ui.end_row();
-                            }
-                        });
-                });
+
+                                for m in matches.iter().take(shown) {
+                                    show_selection_checkbox(ui, selected, m.address);
+                                    show_frozen_checkbox(ui, freeze, m.address, || {
+                                        m.value.to_le_bytes()
+                                    });
+                                    ui.label(format!("{:#x}", m.address));
+                                    ui.label(format_value(m.value));
+                                    if ui.button("Add to saved list").clicked() {
+                                        to_promote = Some(SavedRow {
+                                            entry: CheatEntry {
+                                                description: format!(
+                                                    "{} @ {:#x}",
+                                                    format_value(m.value),
+                                                    m.address
+                                                ),
+                                                base: AddressExpr::Absolute(m.address),
+                                                pointer_offset: None,
+                                                value: EntryValue::Scalar(m.value),
+                                                frozen: false,
+                                            },
+                                            resolved_address: Some(m.address),
+                                            status: RowStatus::Resolved,
+                                        });
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
             }
             Results::Aob(matches) => {
                 let shown = render_result_summary(ui, matches.len(), *capped);
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::Grid::new("results_table")
-                        .striped(true)
-                        .num_columns(4)
-                        .show(ui, |ui| {
-                            ui.strong("");
-                            ui.strong("Frozen");
-                            ui.strong("Address");
-                            ui.strong("Bytes");
-                            ui.end_row();
-
-                            for m in matches.iter().take(shown) {
-                                show_selection_checkbox(ui, selected, m.address);
-                                show_frozen_checkbox(ui, freeze, m.address, || m.bytes.clone());
-                                ui.label(format!("{:#x}", m.address));
-                                ui.label(format_pattern(&m.bytes));
+                egui::ScrollArea::vertical()
+                    .id_salt("results_table_scroll")
+                    .show(ui, |ui| {
+                        egui::Grid::new("results_table")
+                            .striped(true)
+                            .num_columns(5)
+                            .show(ui, |ui| {
+                                ui.strong("");
+                                ui.strong("Frozen");
+                                ui.strong("Address");
+                                ui.strong("Bytes");
+                                ui.strong("");
                                 ui.end_row();
-                            }
-                        });
+
+                                for m in matches.iter().take(shown) {
+                                    show_selection_checkbox(ui, selected, m.address);
+                                    show_frozen_checkbox(ui, freeze, m.address, || m.bytes.clone());
+                                    ui.label(format!("{:#x}", m.address));
+                                    ui.label(format_pattern(&m.bytes));
+                                    if ui.button("Add to saved list").clicked() {
+                                        to_promote = Some(SavedRow {
+                                            entry: CheatEntry {
+                                                description: format!(
+                                                    "{} @ {:#x}",
+                                                    format_pattern(&m.bytes),
+                                                    m.address
+                                                ),
+                                                base: AddressExpr::Absolute(m.address),
+                                                pointer_offset: None,
+                                                value: EntryValue::Bytes(m.bytes.clone()),
+                                                frozen: false,
+                                            },
+                                            resolved_address: Some(m.address),
+                                            status: RowStatus::Resolved,
+                                        });
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            }
+        }
+
+        if let Some(row) = to_promote {
+            self.saved.push(row);
+        }
+    }
+
+    /// Manual "add address" form — works regardless of attach state (the
+    /// row simply shows `NotAttached` until a matching process is attached
+    /// and the next refresh tick resolves it). See the vault's
+    /// `v1-plan.md`.
+    fn show_manual_add_form(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("Add address manually");
+        ui.horizontal(|ui| {
+            ui.label("Description:");
+            ui.text_edit_singleline(&mut self.manual_description);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Address:");
+            ui.text_edit_singleline(&mut self.manual_address_text);
+            ui.label("Pointer offset (optional):");
+            ui.text_edit_singleline(&mut self.manual_pointer_offset_text);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Type:");
+            egui::ComboBox::new("manual_value_type", "")
+                .selected_text(self.manual_value_type.label())
+                .show_ui(ui, |ui| {
+                    for choice in ValueTypeChoice::ALL {
+                        ui.selectable_value(&mut self.manual_value_type, choice, choice.label());
+                    }
                 });
+            ui.label("Value:");
+            ui.text_edit_singleline(&mut self.manual_value_text);
+
+            if ui.button("Add").clicked() {
+                match self.build_manual_entry() {
+                    Ok(entry) => {
+                        self.saved.push(SavedRow {
+                            entry,
+                            resolved_address: None,
+                            status: RowStatus::NotAttached,
+                        });
+                        self.manual_description.clear();
+                        self.manual_address_text.clear();
+                        self.manual_pointer_offset_text.clear();
+                        self.manual_value_text.clear();
+                        self.manual_add_error = None;
+                    }
+                    Err(err) => self.manual_add_error = Some(err),
+                }
+            }
+        });
+        if let Some(err) = &self.manual_add_error {
+            ui.colored_label(egui::Color32::RED, err);
+        }
+    }
+
+    fn build_manual_entry(&self) -> Result<CheatEntry, String> {
+        let base = parse_address_expr(&self.manual_address_text)?;
+        let pointer_offset = if self.manual_pointer_offset_text.trim().is_empty() {
+            None
+        } else {
+            Some(
+                parse_hex_usize(&self.manual_pointer_offset_text).ok_or_else(|| {
+                    format!(
+                        "'{}' isn't a valid hex offset",
+                        self.manual_pointer_offset_text
+                    )
+                })?,
+            )
+        };
+        let value = parse_entry_value(self.manual_value_type, &self.manual_value_text)?;
+        let description = if self.manual_description.trim().is_empty() {
+            self.manual_address_text.trim().to_string()
+        } else {
+            self.manual_description.trim().to_string()
+        };
+
+        Ok(CheatEntry {
+            description,
+            base,
+            pointer_offset,
+            value,
+            frozen: false,
+        })
+    }
+
+    /// Save/load controls: a plain path text field plus two buttons - no
+    /// native file dialog for v1 (a decided simplification, see the vault's
+    /// `v1-plan.md`).
+    fn show_persistence_controls(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Table file:");
+            ui.text_edit_singleline(&mut self.table_path_text);
+
+            if ui.button("Save").clicked() {
+                let entries: Vec<CheatEntry> = self.saved.iter().map(|r| r.entry.clone()).collect();
+                match save_table(&PathBuf::from(self.table_path_text.trim()), &entries) {
+                    Ok(()) => self.table_status = Some(format!("Saved {} entries.", entries.len())),
+                    Err(err) => self.table_status = Some(format!("Save failed: {err}")),
+                }
+            }
+            if ui.button("Load").clicked() {
+                match load_table(&PathBuf::from(self.table_path_text.trim())) {
+                    Ok(entries) => {
+                        self.table_status = Some(format!("Loaded {} entries.", entries.len()));
+                        self.saved = entries
+                            .into_iter()
+                            .map(|entry| SavedRow {
+                                entry,
+                                resolved_address: None,
+                                status: RowStatus::NotAttached,
+                            })
+                            .collect();
+                    }
+                    Err(err) => self.table_status = Some(format!("Load failed: {err}")),
+                }
+            }
+        });
+        if let Some(status) = &self.table_status {
+            ui.label(status);
+        }
+    }
+
+    /// The saved-list panel: shows every saved entry with its live status,
+    /// independent of scan results and of attach state (see the vault's
+    /// `v1-plan.md`).
+    fn show_saved_list_table(&mut self, ui: &mut egui::Ui) {
+        if self.saved.is_empty() {
+            return;
+        }
+        ui.separator();
+        ui.heading("Saved list");
+
+        let freeze_handle = self.attached.as_ref().map(|a| &a.freeze);
+        let mut to_remove: Option<usize> = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("saved_list_scroll")
+            .show(ui, |ui| {
+                egui::Grid::new("saved_list")
+                    .striped(true)
+                    .num_columns(5)
+                    .show(ui, |ui| {
+                        ui.strong("Description");
+                        ui.strong("Address");
+                        ui.strong("Value");
+                        ui.strong("Frozen");
+                        ui.strong("");
+                        ui.end_row();
+
+                        for (index, row) in self.saved.iter_mut().enumerate() {
+                            ui.text_edit_singleline(&mut row.entry.description);
+
+                            let address_text = match (row.resolved_address, &row.status) {
+                                (Some(address), RowStatus::Resolved) => format!("{address:#x}"),
+                                (_, status) => status.label(),
+                            };
+                            ui.label(address_text);
+                            ui.label(format_entry_value(&row.entry.value));
+
+                            match freeze_handle {
+                                Some(freeze) => show_saved_frozen_checkbox(ui, freeze, row),
+                                None => {
+                                    let mut is_frozen = row.entry.frozen;
+                                    ui.add_enabled(false, egui::Checkbox::new(&mut is_frozen, ""));
+                                }
+                            }
+
+                            if ui.button("Remove").clicked() {
+                                to_remove = Some(index);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        if let Some(index) = to_remove {
+            let removed = self.saved.remove(index);
+            if let (Some(freeze), Some(address)) = (
+                self.attached.as_ref().map(|a| &a.freeze),
+                removed.resolved_address,
+            ) {
+                freeze.unfreeze(address);
             }
         }
     }
@@ -563,6 +934,29 @@ fn show_frozen_checkbox(
     }
 }
 
+/// Renders a saved-list row's "Frozen" checkbox. Unlike
+/// `show_frozen_checkbox` (results-table rows, which have no persisted
+/// frozen flag of their own), this also keeps `row.entry.frozen` in sync so
+/// the state round-trips through save/load. Disabled (read-only) when the
+/// row hasn't resolved to a live address - there's no `FreezeHandle` entry
+/// to toggle without one.
+fn show_saved_frozen_checkbox(ui: &mut egui::Ui, freeze: &FreezeHandle, row: &mut SavedRow) {
+    let Some(address) = row.resolved_address else {
+        let mut is_frozen = row.entry.frozen;
+        ui.add_enabled(false, egui::Checkbox::new(&mut is_frozen, ""));
+        return;
+    };
+    let mut is_frozen = freeze.is_frozen(address);
+    if ui.checkbox(&mut is_frozen, "").changed() {
+        if is_frozen {
+            freeze.freeze(address, row.entry.value.to_le_bytes());
+        } else {
+            freeze.unfreeze(address);
+        }
+        row.entry.frozen = is_frozen;
+    }
+}
+
 /// Parses the edit box's text into raw bytes to write: a hex pattern for
 /// `Aob`, or a numeric value's little-endian bytes otherwise. Shared by
 /// "Set Value" - `First Scan` has its own parse step because it also needs
@@ -572,6 +966,19 @@ fn parse_write_bytes(value_type: ValueTypeChoice, text: &str) -> Result<Vec<u8>,
         parse_hex_pattern(text)
     } else {
         value_type.parse(text).map(ScanValue::to_le_bytes)
+    }
+}
+
+/// Parses a manual-add form's value text into an [`EntryValue`] of the
+/// chosen type — the same split `parse_write_bytes` makes, but keeping the
+/// typed `ScanValue`/byte-pattern rather than flattening straight to bytes,
+/// since a saved entry needs to remember its own shape (for live-refresh
+/// re-interpretation and for display).
+fn parse_entry_value(value_type: ValueTypeChoice, text: &str) -> Result<EntryValue, String> {
+    if value_type == ValueTypeChoice::Aob {
+        parse_hex_pattern(text).map(EntryValue::Bytes)
+    } else {
+        value_type.parse(text).map(EntryValue::Scalar)
     }
 }
 
@@ -616,6 +1023,7 @@ impl eframe::App for FerriteApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.check_target_exited();
         self.refresh_live_values();
+        self.refresh_saved_entries();
         if self.attached.is_some() {
             // eframe only repaints reactively (on input) by default - an
             // attached session needs a nudge to keep polling live values
@@ -627,6 +1035,9 @@ impl eframe::App for FerriteApp {
             self.show_process_picker(ui);
             self.show_scan_panel(ui);
             self.show_results_table(ui);
+            self.show_manual_add_form(ui);
+            self.show_persistence_controls(ui);
+            self.show_saved_list_table(ui);
         });
     }
 }
