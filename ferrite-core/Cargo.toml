@@ -9,3 +9,4 @@ description = "GUI-free core: process attach, memory scanning, and read/write pr
 
 [dependencies]
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_Debug"] }
