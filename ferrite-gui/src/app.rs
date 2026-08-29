@@ -1,7 +1,7 @@
 //! The Ferrite application: process picker, scan panel, and results table.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,9 +11,9 @@ use crate::theme;
 use ferrite_core::{
     AddressExpr, AobFilter, AobMatch, AttachError, CheatEntry, DEFAULT_FREEZE_INTERVAL, EntryValue,
     FreezeHandle, ImportReport, ProcessInfo, ProcessSession, ResolveError, ScanFilter, ScanMatch,
-    ScanOptions, ScanValue, first_scan_aob, first_scan_exact, format_pattern, import_ct_file,
-    load_table, next_scan, next_scan_aob, parse_address_expr, parse_hex_pattern, parse_hex_usize,
-    resolve_address, save_table,
+    ScanOptions, ScanValue, extract_icon_rgba, first_scan_aob, first_scan_exact, format_pattern,
+    import_ct_file, load_table, next_scan, next_scan_aob, parse_address_expr, parse_hex_pattern,
+    parse_hex_usize, resolve_address, save_table,
 };
 
 /// How many result rows the table actually renders. Independent of
@@ -194,6 +194,12 @@ pub struct FerriteApp {
     table_path_text: String,
     table_status: Option<String>,
     import_report: Option<ImportReport>,
+    /// Icon textures keyed by exe path, `None` cached for a path that
+    /// failed extraction (no icon, or a pseudo-process with no exe at
+    /// all) so a bad path isn't retried every frame. Extraction is lazy
+    /// (first time a path is drawn) and never cleared - an exe's icon
+    /// doesn't change mid-session.
+    icon_cache: HashMap<PathBuf, Option<egui::TextureHandle>>,
 }
 
 impl FerriteApp {
@@ -221,6 +227,7 @@ impl FerriteApp {
             table_path_text: String::new(),
             table_status: None,
             import_report: None,
+            icon_cache: HashMap::new(),
         }
     }
 
@@ -394,6 +401,28 @@ impl FerriteApp {
         }
     }
 
+    /// Looks up (extracting and caching on first use) the icon texture for
+    /// an exe path. `None` covers both "no exe path at all" (pseudo-
+    /// processes) and "extraction failed" - either way, the caller just
+    /// reserves blank space instead of an image.
+    fn icon_texture(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+        self.icon_cache
+            .entry(path.to_path_buf())
+            .or_insert_with(|| {
+                let icon = extract_icon_rgba(path)?;
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width as usize, icon.height as usize],
+                    &icon.rgba,
+                );
+                Some(ctx.load_texture(
+                    path.display().to_string(),
+                    image,
+                    egui::TextureOptions::default(),
+                ))
+            })
+            .clone()
+    }
+
     fn show_process_picker(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Ferrite");
@@ -422,14 +451,16 @@ impl FerriteApp {
                     self.processes = sorted_processes();
                 }
 
+                let ctx = ui.ctx().clone();
                 egui::ScrollArea::vertical()
                     .id_salt("process_list_scroll")
                     .max_height(300.0)
                     .show(ui, |ui| {
                         egui::Grid::new("process_list")
                             .striped(true)
-                            .num_columns(3)
+                            .num_columns(4)
                             .show(ui, |ui| {
+                                ui.strong("");
                                 ui.strong("PID");
                                 ui.strong("Name");
                                 ui.end_row();
@@ -439,6 +470,21 @@ impl FerriteApp {
                                 // self.processes while also needing &mut
                                 // self to attach.
                                 for process in self.processes.clone() {
+                                    let icon = process
+                                        .exe
+                                        .as_deref()
+                                        .and_then(|path| self.icon_texture(&ctx, path));
+                                    match icon {
+                                        Some(texture) => {
+                                            ui.add(
+                                                egui::Image::new(&texture)
+                                                    .fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                                            );
+                                        }
+                                        None => {
+                                            ui.allocate_space(egui::vec2(16.0, 16.0));
+                                        }
+                                    }
                                     ui.label(process.pid.to_string());
                                     ui.label(&process.name);
                                     if ui.button("Attach").clicked() {
@@ -833,22 +879,38 @@ impl FerriteApp {
         theme::card().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Table file:");
-                ui.text_edit_singleline(&mut self.table_path_text);
+                let path_text = if self.table_path_text.is_empty() {
+                    "(none selected)"
+                } else {
+                    &self.table_path_text
+                };
+                ui.weak(path_text);
 
-                if ui.button("Save").clicked() {
+                if ui.button("Save…").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_file_name("cheat_table.json")
+                        .add_filter("Ferrite table", &["json"])
+                        .save_file()
+                {
                     let entries: Vec<CheatEntry> =
                         self.saved.iter().map(|r| r.entry.clone()).collect();
-                    match save_table(&PathBuf::from(self.table_path_text.trim()), &entries) {
+                    match save_table(&path, &entries) {
                         Ok(()) => {
-                            self.table_status = Some(format!("Saved {} entries.", entries.len()))
+                            self.table_status = Some(format!("Saved {} entries.", entries.len()));
+                            self.table_path_text = path.display().to_string();
                         }
                         Err(err) => self.table_status = Some(format!("Save failed: {err}")),
                     }
                 }
-                if ui.button("Load").clicked() {
-                    match load_table(&PathBuf::from(self.table_path_text.trim())) {
+                if ui.button("Load…").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Ferrite table", &["json"])
+                        .pick_file()
+                {
+                    match load_table(&path) {
                         Ok(entries) => {
                             self.table_status = Some(format!("Loaded {} entries.", entries.len()));
+                            self.table_path_text = path.display().to_string();
                             self.saved = entries
                                 .into_iter()
                                 .map(|entry| SavedRow {
@@ -861,14 +923,19 @@ impl FerriteApp {
                         Err(err) => self.table_status = Some(format!("Load failed: {err}")),
                     }
                 }
-                if ui.button("Import .CT").clicked() {
-                    match import_ct_file(&PathBuf::from(self.table_path_text.trim())) {
+                if ui.button("Import .CT…").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Cheat Engine table", &["CT", "ct"])
+                        .pick_file()
+                {
+                    match import_ct_file(&path) {
                         Ok(report) => {
                             self.table_status = Some(format!(
                                 "Imported {} entries ({} skipped — see below).",
                                 report.imported.len(),
                                 report.skipped.len()
                             ));
+                            self.table_path_text = path.display().to_string();
                             for entry in &report.imported {
                                 self.saved.push(SavedRow {
                                     entry: entry.clone(),

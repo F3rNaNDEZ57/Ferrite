@@ -14,3 +14,4 @@ eframe = { version = "0.36.1", default-features = false, features = [
     "accesskit",
 ] }
 ferrite-core = { path = "../ferrite-core" }
+rfd = "0.17"
