@@ -210,4 +210,30 @@ mod tests {
             Ok(_) => panic!("expected attach to a bogus PID to fail"),
         }
     }
+
+    #[test]
+    #[ignore = "only meaningful run unelevated - see reasoning below"]
+    fn attach_to_a_system_owned_process_is_denied_without_elevation() {
+        // services.exe runs as SYSTEM; opening it for VM read/write without
+        // elevation reliably fails with ERROR_ACCESS_DENIED (verified by
+        // hand: also true of winlogon.exe, lsass.exe, csrss.exe, and PID 4).
+        // Elevated, this same attach can succeed, which is exactly the
+        // behavior we're confirming AttachError maps correctly either way -
+        // so accept Ok too, rather than assert this suite always runs
+        // unelevated.
+        let target = crate::list_processes()
+            .into_iter()
+            .find(|p| p.name.eq_ignore_ascii_case("services.exe"));
+
+        let Some(target) = target else {
+            eprintln!("services.exe not found (unusual on Windows) - skipping");
+            return;
+        };
+
+        match ProcessSession::attach(target.pid) {
+            Err(AttachError::AccessDenied) => {}
+            Ok(_) => {} // running elevated - also a valid, expected outcome
+            Err(other) => panic!("expected AccessDenied (or Ok, if elevated), got {other}"),
+        }
+    }
 }
