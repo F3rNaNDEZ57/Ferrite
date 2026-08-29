@@ -7,6 +7,7 @@
 //! for the full v1 scope and build plan.
 
 pub mod aob;
+pub mod freeze;
 pub mod process;
 pub mod regions;
 pub mod scan;
@@ -17,6 +18,7 @@ pub use aob::{
     AobFilter, AobMatch, AobScanResult, first_scan_aob, format_pattern, next_scan_aob,
     parse_hex_pattern, scan_region_aob,
 };
+pub use freeze::{DEFAULT_FREEZE_INTERVAL, FreezeHandle};
 pub use process::{ProcessInfo, list_processes};
 pub use regions::MemoryRegion;
 pub use scan::{

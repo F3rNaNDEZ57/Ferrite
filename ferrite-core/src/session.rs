@@ -7,11 +7,12 @@
 use core::ffi::c_void;
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, STILL_ACTIVE,
 };
 use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+    PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 use windows::core::HRESULT;
 
@@ -105,6 +106,16 @@ pub struct ProcessSession {
     pid: u32,
 }
 
+// SAFETY: `HANDLE` wraps a raw pointer, so `ProcessSession` isn't Send/Sync
+// by default. The only operations it performs on that handle -
+// ReadProcessMemory, WriteProcessMemory, GetExitCodeProcess - are documented
+// safe to call concurrently, from any thread, on the same handle. This lets
+// the freeze thread (`freeze.rs`) share one session with the GUI thread via
+// `Arc<ProcessSession>` (`Arc<T>: Send` requires `T: Send + Sync`) - see the
+// concurrency model in the vault's `v1-plan.md`.
+unsafe impl Send for ProcessSession {}
+unsafe impl Sync for ProcessSession {}
+
 impl ProcessSession {
     /// Opens `pid` with exactly the access rights v1 needs — not
     /// `PROCESS_ALL_ACCESS` — per the vault's `v1-scope.md`.
@@ -131,6 +142,27 @@ impl ProcessSession {
     /// see `ProcessSession`'s own methods.
     pub(crate) fn handle(&self) -> HANDLE {
         self.handle
+    }
+
+    /// Cheaply checks whether the attached process has actually terminated,
+    /// via `GetExitCodeProcess` (needs only `PROCESS_QUERY_INFORMATION`,
+    /// which `attach` already requests - unlike `WaitForSingleObject`,
+    /// which needs `SYNCHRONIZE` and would otherwise silently fail on this
+    /// session's handle). `STILL_ACTIVE` means it's still running; anything
+    /// else means it has exited. Used by the freeze thread to distinguish
+    /// "the target process exited" from "one write to one now-invalid
+    /// address failed" before reporting the session as dead.
+    pub(crate) fn has_exited(&self) -> bool {
+        let mut exit_code = 0u32;
+        // SAFETY: `self.handle` is a valid process handle and `exit_code`
+        // is a valid, uniquely-owned `u32` for the duration of this call.
+        let result = unsafe { GetExitCodeProcess(self.handle, &raw mut exit_code) };
+        match result {
+            Ok(()) => exit_code != STILL_ACTIVE.0 as u32,
+            // Can't determine the exit code at all - don't claim the
+            // process exited on the strength of an unrelated OS error.
+            Err(_) => false,
+        }
     }
 
     /// Reads `len` bytes from the attached process's memory at `address`.
