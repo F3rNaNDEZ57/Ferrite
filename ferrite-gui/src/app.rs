@@ -2,8 +2,9 @@
 
 use eframe::egui;
 use ferrite_core::{
-    AttachError, ProcessInfo, ProcessSession, ScanFilter, ScanMatch, ScanOptions, ScanValue,
-    first_scan_exact, next_scan,
+    AobFilter, AobMatch, AttachError, ProcessInfo, ProcessSession, ScanFilter, ScanMatch,
+    ScanOptions, ScanValue, first_scan_aob, first_scan_exact, format_pattern, next_scan,
+    next_scan_aob, parse_hex_pattern,
 };
 
 /// How many result rows the table actually renders. Independent of
@@ -21,16 +22,18 @@ enum ValueTypeChoice {
     I64,
     F32,
     F64,
+    Aob,
 }
 
 impl ValueTypeChoice {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::I8,
         Self::I16,
         Self::I32,
         Self::I64,
         Self::F32,
         Self::F64,
+        Self::Aob,
     ];
 
     fn label(self) -> &'static str {
@@ -41,9 +44,13 @@ impl ValueTypeChoice {
             Self::I64 => "i64",
             Self::F32 => "f32",
             Self::F64 => "f64",
+            Self::Aob => "AOB (bytes)",
         }
     }
 
+    /// Parses a numeric value. Never called for `Aob` — that variant goes
+    /// through `parse_hex_pattern` instead, since a byte pattern isn't a
+    /// `ScanValue`.
     fn parse(self, text: &str) -> Result<ScanValue, String> {
         let text = text.trim();
         let parsed = match self {
@@ -53,6 +60,9 @@ impl ValueTypeChoice {
             Self::I64 => text.parse().ok().map(ScanValue::I64),
             Self::F32 => text.parse().ok().map(ScanValue::F32),
             Self::F64 => text.parse().ok().map(ScanValue::F64),
+            Self::Aob => {
+                unreachable!("Aob is parsed via parse_hex_pattern, not ValueTypeChoice::parse")
+            }
         };
         parsed.ok_or_else(|| format!("'{text}' isn't a valid {}", self.label()))
     }
@@ -69,14 +79,20 @@ fn format_value(value: ScanValue) -> String {
     }
 }
 
+/// A scan's results are one kind or the other, never both — an `Option` of
+/// two parallel lists would let them disagree about which is current.
+enum Results {
+    Numeric(Vec<ScanMatch>),
+    Aob(Vec<AobMatch>),
+}
+
 /// An active attach: the session plus everything scoped to it. Dropping this
 /// (via Detach) closes the process handle, per `ProcessSession`'s RAII Drop.
 struct Attached {
     session: ProcessSession,
     process_name: String,
     pid: u32,
-    matches: Vec<ScanMatch>,
-    has_scanned: bool,
+    results: Option<Results>,
     capped: bool,
 }
 
@@ -88,6 +104,7 @@ pub struct FerriteApp {
     input_text: String,
     input_error: Option<String>,
     filter: ScanFilter,
+    aob_filter: AobFilter,
 }
 
 impl FerriteApp {
@@ -100,6 +117,7 @@ impl FerriteApp {
             input_text: String::new(),
             input_error: None,
             filter: ScanFilter::Changed,
+            aob_filter: AobFilter::Changed,
         }
     }
 
@@ -110,8 +128,7 @@ impl FerriteApp {
                     session,
                     process_name: process.name.clone(),
                     pid: process.pid,
-                    matches: Vec::new(),
-                    has_scanned: false,
+                    results: None,
                     capped: false,
                 });
                 self.attach_error = None;
@@ -187,6 +204,7 @@ impl FerriteApp {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Type:");
+            let previous_type = self.value_type;
             egui::ComboBox::new("value_type", "")
                 .selected_text(self.value_type.label())
                 .show_ui(ui, |ui| {
@@ -194,27 +212,46 @@ impl FerriteApp {
                         ui.selectable_value(&mut self.value_type, choice, choice.label());
                     }
                 });
+            if self.value_type != previous_type {
+                // Switching types mid-session invalidates the current
+                // results (a filter for one kind is meaningless applied to
+                // the other) - clear rather than let them go stale.
+                attached.results = None;
+                attached.capped = false;
+            }
 
-            ui.label("Value:");
+            let is_aob = self.value_type == ValueTypeChoice::Aob;
+            ui.label(if is_aob { "Pattern:" } else { "Value:" });
             ui.text_edit_singleline(&mut self.input_text);
 
             if ui.button("First Scan").clicked() {
-                match self.value_type.parse(&self.input_text) {
-                    Ok(target) => {
-                        let result =
-                            first_scan_exact(&attached.session, target, ScanOptions::default());
-                        attached.matches = result.matches;
-                        attached.capped = result.capped;
-                        attached.has_scanned = true;
-                        self.input_error = None;
+                if is_aob {
+                    match parse_hex_pattern(&self.input_text) {
+                        Ok(pattern) => {
+                            let result =
+                                first_scan_aob(&attached.session, &pattern, ScanOptions::default());
+                            attached.capped = result.capped;
+                            attached.results = Some(Results::Aob(result.matches));
+                            self.input_error = None;
+                        }
+                        Err(err) => self.input_error = Some(err),
                     }
-                    Err(err) => self.input_error = Some(err),
+                } else {
+                    match self.value_type.parse(&self.input_text) {
+                        Ok(target) => {
+                            let result =
+                                first_scan_exact(&attached.session, target, ScanOptions::default());
+                            attached.capped = result.capped;
+                            attached.results = Some(Results::Numeric(result.matches));
+                            self.input_error = None;
+                        }
+                        Err(err) => self.input_error = Some(err),
+                    }
                 }
             }
 
-            if attached.has_scanned && ui.button("New Scan").clicked() {
-                attached.matches.clear();
-                attached.has_scanned = false;
+            if attached.results.is_some() && ui.button("New Scan").clicked() {
+                attached.results = None;
                 attached.capped = false;
             }
         });
@@ -223,24 +260,50 @@ impl FerriteApp {
             ui.colored_label(egui::Color32::RED, err);
         }
 
-        if attached.has_scanned {
+        let is_aob_results = matches!(attached.results, Some(Results::Aob(_)));
+        if attached.results.is_some() {
             ui.horizontal(|ui| {
                 ui.label("Next scan filter:");
-                egui::ComboBox::new("scan_filter", "")
-                    .selected_text(filter_label(self.filter))
-                    .show_ui(ui, |ui| {
-                        for filter in [
-                            ScanFilter::Changed,
-                            ScanFilter::Unchanged,
-                            ScanFilter::Increased,
-                            ScanFilter::Decreased,
-                        ] {
-                            ui.selectable_value(&mut self.filter, filter, filter_label(filter));
-                        }
-                    });
+                if is_aob_results {
+                    egui::ComboBox::new("scan_filter", "")
+                        .selected_text(aob_filter_label(self.aob_filter))
+                        .show_ui(ui, |ui| {
+                            for filter in [AobFilter::Changed, AobFilter::Unchanged] {
+                                ui.selectable_value(
+                                    &mut self.aob_filter,
+                                    filter,
+                                    aob_filter_label(filter),
+                                );
+                            }
+                        });
+                } else {
+                    egui::ComboBox::new("scan_filter", "")
+                        .selected_text(filter_label(self.filter))
+                        .show_ui(ui, |ui| {
+                            for filter in [
+                                ScanFilter::Changed,
+                                ScanFilter::Unchanged,
+                                ScanFilter::Increased,
+                                ScanFilter::Decreased,
+                            ] {
+                                ui.selectable_value(&mut self.filter, filter, filter_label(filter));
+                            }
+                        });
+                }
 
                 if ui.button("Next Scan").clicked() {
-                    attached.matches = next_scan(&attached.session, &attached.matches, self.filter);
+                    match &attached.results {
+                        Some(Results::Numeric(matches)) => {
+                            let updated = next_scan(&attached.session, matches, self.filter);
+                            attached.results = Some(Results::Numeric(updated));
+                        }
+                        Some(Results::Aob(matches)) => {
+                            let updated =
+                                next_scan_aob(&attached.session, matches, self.aob_filter);
+                            attached.results = Some(Results::Aob(updated));
+                        }
+                        None => {}
+                    }
                     attached.capped = false; // next_scan only narrows, never re-caps
                 }
             });
@@ -251,38 +314,67 @@ impl FerriteApp {
         let Some(attached) = &self.attached else {
             return;
         };
-        if !attached.has_scanned {
+        let Some(results) = &attached.results else {
             return;
-        }
+        };
 
         ui.separator();
-        let total = attached.matches.len();
-        let shown = total.min(MAX_RENDERED_ROWS);
-        let mut summary = format!("{total} result(s)");
-        if attached.capped {
-            summary.push_str(" (scan stopped early — too many matches; narrow your search)");
-        } else if total > shown {
-            summary.push_str(&format!(" — showing first {shown}"));
-        }
-        ui.label(summary);
+        match results {
+            Results::Numeric(matches) => {
+                let shown = render_result_summary(ui, matches.len(), attached.capped);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("results_table")
+                        .striped(true)
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.strong("Address");
+                            ui.strong("Value");
+                            ui.end_row();
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("results_table")
-                .striped(true)
-                .num_columns(2)
-                .show(ui, |ui| {
-                    ui.strong("Address");
-                    ui.strong("Value");
-                    ui.end_row();
-
-                    for m in attached.matches.iter().take(MAX_RENDERED_ROWS) {
-                        ui.label(format!("{:#x}", m.address));
-                        ui.label(format_value(m.value));
-                        ui.end_row();
-                    }
+                            for m in matches.iter().take(shown) {
+                                ui.label(format!("{:#x}", m.address));
+                                ui.label(format_value(m.value));
+                                ui.end_row();
+                            }
+                        });
                 });
-        });
+            }
+            Results::Aob(matches) => {
+                let shown = render_result_summary(ui, matches.len(), attached.capped);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::Grid::new("results_table")
+                        .striped(true)
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.strong("Address");
+                            ui.strong("Bytes");
+                            ui.end_row();
+
+                            for m in matches.iter().take(shown) {
+                                ui.label(format!("{:#x}", m.address));
+                                ui.label(format_pattern(&m.bytes));
+                                ui.end_row();
+                            }
+                        });
+                });
+            }
+        }
     }
+}
+
+/// Renders the "N result(s) [capped / showing first M]" summary line shared
+/// by both results kinds, and returns how many rows the caller should
+/// actually render.
+fn render_result_summary(ui: &mut egui::Ui, total: usize, capped: bool) -> usize {
+    let shown = total.min(MAX_RENDERED_ROWS);
+    let mut summary = format!("{total} result(s)");
+    if capped {
+        summary.push_str(" (scan stopped early — too many matches; narrow your search)");
+    } else if total > shown {
+        summary.push_str(&format!(" — showing first {shown}"));
+    }
+    ui.label(summary);
+    shown
 }
 
 fn filter_label(filter: ScanFilter) -> &'static str {
@@ -291,6 +383,13 @@ fn filter_label(filter: ScanFilter) -> &'static str {
         ScanFilter::Unchanged => "Unchanged",
         ScanFilter::Increased => "Increased",
         ScanFilter::Decreased => "Decreased",
+    }
+}
+
+fn aob_filter_label(filter: AobFilter) -> &'static str {
+    match filter {
+        AobFilter::Changed => "Changed",
+        AobFilter::Unchanged => "Unchanged",
     }
 }
 
