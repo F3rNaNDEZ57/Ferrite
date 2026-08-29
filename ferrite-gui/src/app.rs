@@ -1,5 +1,7 @@
 //! The Ferrite application: process picker, scan panel, and results table.
 
+use std::time::{Duration, Instant};
+
 use eframe::egui;
 use ferrite_core::{
     AobFilter, AobMatch, AttachError, ProcessInfo, ProcessSession, ScanFilter, ScanMatch,
@@ -13,6 +15,12 @@ use ferrite_core::{
 /// rows every frame, which crawls. The table shows this many and reports the
 /// true total separately.
 const MAX_RENDERED_ROWS: usize = 500;
+
+/// How often displayed rows are re-read from the target process. Throttled
+/// rather than every frame - at 60fps, re-reading up to `MAX_RENDERED_ROWS`
+/// rows every frame would mean tens of thousands of `ReadProcessMemory`
+/// calls a second for no visible benefit at that refresh rate.
+const LIVE_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValueTypeChoice {
@@ -94,6 +102,7 @@ struct Attached {
     pid: u32,
     results: Option<Results>,
     capped: bool,
+    last_refresh: Instant,
 }
 
 pub struct FerriteApp {
@@ -130,6 +139,7 @@ impl FerriteApp {
                     pid: process.pid,
                     results: None,
                     capped: false,
+                    last_refresh: Instant::now(),
                 });
                 self.attach_error = None;
             }
@@ -141,6 +151,47 @@ impl FerriteApp {
                     AttachError::ProcessNotFound => "That process no longer exists.".to_string(),
                     AttachError::Other(code) => format!("Couldn't attach (OS error {code})."),
                 });
+            }
+        }
+    }
+
+    /// Re-reads each displayed row's current bytes from the target process,
+    /// throttled to `LIVE_REFRESH_INTERVAL`. Rows beyond `MAX_RENDERED_ROWS`
+    /// aren't refreshed - they aren't drawn either, so there's nothing to
+    /// keep current. A row whose address fails to read (e.g. the page was
+    /// freed) is left showing its last known value rather than removed -
+    /// unlike a scan filter, a live-refresh miss isn't a judgment that the
+    /// row no longer matches.
+    fn refresh_live_values(&mut self) {
+        let Some(attached) = &mut self.attached else {
+            return;
+        };
+        if attached.last_refresh.elapsed() < LIVE_REFRESH_INTERVAL {
+            return;
+        }
+        attached.last_refresh = Instant::now();
+
+        let Attached {
+            session, results, ..
+        } = attached;
+        let Some(results) = results else {
+            return;
+        };
+
+        match results {
+            Results::Numeric(matches) => {
+                for m in matches.iter_mut().take(MAX_RENDERED_ROWS) {
+                    if let Ok(bytes) = session.read_bytes(m.address, m.value.size()) {
+                        m.value = m.value.from_le_bytes_like(&bytes);
+                    }
+                }
+            }
+            Results::Aob(matches) => {
+                for m in matches.iter_mut().take(MAX_RENDERED_ROWS) {
+                    if let Ok(bytes) = session.read_bytes(m.address, m.bytes.len()) {
+                        m.bytes = bytes;
+                    }
+                }
             }
         }
     }
@@ -401,6 +452,14 @@ fn sorted_processes() -> Vec<ProcessInfo> {
 
 impl eframe::App for FerriteApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.refresh_live_values();
+        if self.attached.is_some() {
+            // eframe only repaints reactively (on input) by default - an
+            // attached session needs a nudge to keep polling live values
+            // even when the user isn't touching anything.
+            ui.ctx().request_repaint_after(LIVE_REFRESH_INTERVAL);
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             self.show_process_picker(ui);
             self.show_scan_panel(ui);
