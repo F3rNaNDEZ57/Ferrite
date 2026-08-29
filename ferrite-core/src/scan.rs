@@ -1,9 +1,9 @@
-//! The scan engine: walks a process's writable memory regions for an
-//! exact-value first scan. Next-scan filters (changed/unchanged/inc/dec)
-//! land in a later commit.
+//! The scan engine: an exact-value first scan across a process's writable
+//! memory regions, and next-scan filters that re-check previously matched
+//! addresses.
 
 use crate::regions::MemoryRegion;
-use crate::scan_value::{ScanValue, bytes_match_exact};
+use crate::scan_value::{ScanFilter, ScanValue, bytes_match_exact, passes_filter};
 use crate::session::ProcessSession;
 
 /// "2 decimal places" — matches typical in-game display precision (health,
@@ -84,6 +84,39 @@ pub fn first_scan_exact(
 
     let capped = matches.len() >= options.max_results;
     FirstScanResult { matches, capped }
+}
+
+/// Re-checks previously matched addresses against `filter`, returning the
+/// surviving matches with their values updated to what's there *now*.
+///
+/// Deliberately dumb: no chunking, no region walk — `matches` is a list of
+/// discrete addresses to individually re-read, not a memory range to scan,
+/// so a straight loop of small reads is both correct and simpler than
+/// reusing the first-scan machinery here.
+///
+/// Updating the stored value on every surviving match (rather than keeping
+/// the value from the *previous* scan) matters: without it, a second
+/// `Changed` scan in a row would compare against an already-stale baseline
+/// and report changes that already happened on the first scan. A match
+/// whose address can no longer be read (the page was freed, or the process
+/// is exiting) is dropped, not retained with a stale value — a retained but
+/// unreadable entry would be a phantom result the GUI has nothing to show.
+pub fn next_scan(
+    session: &ProcessSession,
+    matches: &[ScanMatch],
+    filter: ScanFilter,
+) -> Vec<ScanMatch> {
+    matches
+        .iter()
+        .filter_map(|m| {
+            let bytes = session.read_bytes(m.address, m.value.size()).ok()?;
+            let new_value = m.value.from_le_bytes_like(&bytes);
+            passes_filter(m.value, new_value, filter).then_some(ScanMatch {
+                address: m.address,
+                value: new_value,
+            })
+        })
+        .collect()
 }
 
 /// Scans a single region for an exact-value match against `target`,
