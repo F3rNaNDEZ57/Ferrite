@@ -7,6 +7,7 @@
 //! for the full v1 scope and build plan.
 
 pub mod aob;
+pub mod ct_import;
 pub mod freeze;
 pub mod modules;
 pub mod pointer;
@@ -21,6 +22,7 @@ pub use aob::{
     AobFilter, AobMatch, AobScanResult, first_scan_aob, format_pattern, next_scan_aob,
     parse_hex_pattern, scan_region_aob,
 };
+pub use ct_import::{CtImportError, ImportReport, SkippedEntry, import_ct_file, import_ct_xml};
 pub use freeze::{DEFAULT_FREEZE_INTERVAL, FreezeHandle};
 pub use modules::{ModuleError, ModuleInfo, list_modules, module_base};
 pub use pointer::resolve_pointer;
