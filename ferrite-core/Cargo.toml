@@ -8,3 +8,4 @@ repository.workspace = true
 description = "GUI-free core: process attach, memory scanning, and read/write primitives for Ferrite."
 
 [dependencies]
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
