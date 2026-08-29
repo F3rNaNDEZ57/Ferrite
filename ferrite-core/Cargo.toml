@@ -1,0 +1,10 @@
+[package]
+name = "ferrite-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GUI-free core: process attach, memory scanning, and read/write primitives for Ferrite."
+
+[dependencies]

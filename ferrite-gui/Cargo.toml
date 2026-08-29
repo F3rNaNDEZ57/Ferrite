@@ -1,0 +1,11 @@
+[package]
+name = "ferrite-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Ferrite desktop application."
+
+[dependencies]
+ferrite-core = { path = "../ferrite-core" }

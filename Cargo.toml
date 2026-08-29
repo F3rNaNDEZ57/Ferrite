@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["ferrite-core", "ferrite-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["F3rNaNDEZ57"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/F3rNaNDEZ57/Ferrite"
+description = "A memory-safe, Rust-native reimplementation of the Cheat Engine idea."
