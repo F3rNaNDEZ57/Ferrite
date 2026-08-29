@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+
+use crate::theme;
 use ferrite_core::{
     AddressExpr, AobFilter, AobMatch, AttachError, CheatEntry, DEFAULT_FREEZE_INTERVAL, EntryValue,
     FreezeHandle, ImportReport, ProcessInfo, ProcessSession, ResolveError, ScanFilter, ScanMatch,
@@ -408,43 +410,45 @@ impl FerriteApp {
         });
 
         if let Some(err) = &self.attach_error {
-            ui.colored_label(egui::Color32::RED, err);
+            ui.colored_label(theme::ERROR, err);
         }
         if let Some(msg) = &self.process_exited_message {
-            ui.colored_label(egui::Color32::RED, msg);
+            ui.colored_label(theme::ERROR, msg);
         }
 
         if self.attached.is_none() {
-            ui.separator();
-            if ui.button("Refresh process list").clicked() {
-                self.processes = sorted_processes();
-            }
+            theme::card().show(ui, |ui| {
+                if ui.button("Refresh process list").clicked() {
+                    self.processes = sorted_processes();
+                }
 
-            egui::ScrollArea::vertical()
-                .id_salt("process_list_scroll")
-                .max_height(300.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("process_list")
-                        .striped(true)
-                        .num_columns(3)
-                        .show(ui, |ui| {
-                            ui.strong("PID");
-                            ui.strong("Name");
-                            ui.end_row();
-
-                            // Clone the list up front: attaching inside the
-                            // loop would otherwise borrow self.processes
-                            // while also needing &mut self to attach.
-                            for process in self.processes.clone() {
-                                ui.label(process.pid.to_string());
-                                ui.label(&process.name);
-                                if ui.button("Attach").clicked() {
-                                    self.attach(&process);
-                                }
+                egui::ScrollArea::vertical()
+                    .id_salt("process_list_scroll")
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("process_list")
+                            .striped(true)
+                            .num_columns(3)
+                            .show(ui, |ui| {
+                                ui.strong("PID");
+                                ui.strong("Name");
                                 ui.end_row();
-                            }
-                        });
-                });
+
+                                // Clone the list up front: attaching inside
+                                // the loop would otherwise borrow
+                                // self.processes while also needing &mut
+                                // self to attach.
+                                for process in self.processes.clone() {
+                                    ui.label(process.pid.to_string());
+                                    ui.label(&process.name);
+                                    if ui.button("Attach").clicked() {
+                                        self.attach(&process);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
         }
     }
 
@@ -453,117 +457,129 @@ impl FerriteApp {
             return;
         };
 
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Type:");
-            let previous_type = self.value_type;
-            egui::ComboBox::new("value_type", "")
-                .selected_text(self.value_type.label())
-                .show_ui(ui, |ui| {
-                    for choice in ValueTypeChoice::ALL {
-                        ui.selectable_value(&mut self.value_type, choice, choice.label());
-                    }
-                });
-            if self.value_type != previous_type {
-                // Switching types mid-session invalidates the current
-                // results (a filter for one kind is meaningless applied to
-                // the other) - clear rather than let them go stale, and
-                // drop selections along with them (frozen entries are left
-                // alone - they're independent of what's currently shown).
-                attached.results = None;
-                attached.capped = false;
-                attached.selected.clear();
-            }
-
-            let is_aob = self.value_type == ValueTypeChoice::Aob;
-            ui.label(if is_aob { "Pattern:" } else { "Value:" });
-            ui.text_edit_singleline(&mut self.input_text);
-
-            if ui.button("First Scan").clicked() {
-                if is_aob {
-                    match parse_hex_pattern(&self.input_text) {
-                        Ok(pattern) => {
-                            let result =
-                                first_scan_aob(&attached.session, &pattern, ScanOptions::default());
-                            attached.capped = result.capped;
-                            attached.results = Some(Results::Aob(result.matches));
-                            self.input_error = None;
-                        }
-                        Err(err) => self.input_error = Some(err),
-                    }
-                } else {
-                    match self.value_type.parse(&self.input_text) {
-                        Ok(target) => {
-                            let result =
-                                first_scan_exact(&attached.session, target, ScanOptions::default());
-                            attached.capped = result.capped;
-                            attached.results = Some(Results::Numeric(result.matches));
-                            self.input_error = None;
-                        }
-                        Err(err) => self.input_error = Some(err),
-                    }
-                }
-            }
-
-            if attached.results.is_some() && ui.button("New Scan").clicked() {
-                attached.results = None;
-                attached.capped = false;
-                attached.selected.clear();
-            }
-        });
-
-        if let Some(err) = &self.input_error {
-            ui.colored_label(egui::Color32::RED, err);
-        }
-
-        let is_aob_results = matches!(attached.results, Some(Results::Aob(_)));
-        if attached.results.is_some() {
+        theme::card().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Next scan filter:");
-                if is_aob_results {
-                    egui::ComboBox::new("scan_filter", "")
-                        .selected_text(aob_filter_label(self.aob_filter))
-                        .show_ui(ui, |ui| {
-                            for filter in [AobFilter::Changed, AobFilter::Unchanged] {
-                                ui.selectable_value(
-                                    &mut self.aob_filter,
-                                    filter,
-                                    aob_filter_label(filter),
-                                );
-                            }
-                        });
-                } else {
-                    egui::ComboBox::new("scan_filter", "")
-                        .selected_text(filter_label(self.filter))
-                        .show_ui(ui, |ui| {
-                            for filter in [
-                                ScanFilter::Changed,
-                                ScanFilter::Unchanged,
-                                ScanFilter::Increased,
-                                ScanFilter::Decreased,
-                            ] {
-                                ui.selectable_value(&mut self.filter, filter, filter_label(filter));
-                            }
-                        });
+                ui.label("Type:");
+                let previous_type = self.value_type;
+                egui::ComboBox::new("value_type", "")
+                    .selected_text(self.value_type.label())
+                    .show_ui(ui, |ui| {
+                        for choice in ValueTypeChoice::ALL {
+                            ui.selectable_value(&mut self.value_type, choice, choice.label());
+                        }
+                    });
+                if self.value_type != previous_type {
+                    // Switching types mid-session invalidates the current
+                    // results (a filter for one kind is meaningless applied
+                    // to the other) - clear rather than let them go stale,
+                    // and drop selections along with them (frozen entries
+                    // are left alone - they're independent of what's
+                    // currently shown).
+                    attached.results = None;
+                    attached.capped = false;
+                    attached.selected.clear();
                 }
 
-                if ui.button("Next Scan").clicked() {
-                    match &attached.results {
-                        Some(Results::Numeric(matches)) => {
-                            let updated = next_scan(&attached.session, matches, self.filter);
-                            attached.results = Some(Results::Numeric(updated));
+                let is_aob = self.value_type == ValueTypeChoice::Aob;
+                ui.label(if is_aob { "Pattern:" } else { "Value:" });
+                ui.text_edit_singleline(&mut self.input_text);
+
+                if ui.button("First Scan").clicked() {
+                    if is_aob {
+                        match parse_hex_pattern(&self.input_text) {
+                            Ok(pattern) => {
+                                let result = first_scan_aob(
+                                    &attached.session,
+                                    &pattern,
+                                    ScanOptions::default(),
+                                );
+                                attached.capped = result.capped;
+                                attached.results = Some(Results::Aob(result.matches));
+                                self.input_error = None;
+                            }
+                            Err(err) => self.input_error = Some(err),
                         }
-                        Some(Results::Aob(matches)) => {
-                            let updated =
-                                next_scan_aob(&attached.session, matches, self.aob_filter);
-                            attached.results = Some(Results::Aob(updated));
+                    } else {
+                        match self.value_type.parse(&self.input_text) {
+                            Ok(target) => {
+                                let result = first_scan_exact(
+                                    &attached.session,
+                                    target,
+                                    ScanOptions::default(),
+                                );
+                                attached.capped = result.capped;
+                                attached.results = Some(Results::Numeric(result.matches));
+                                self.input_error = None;
+                            }
+                            Err(err) => self.input_error = Some(err),
                         }
-                        None => {}
                     }
-                    attached.capped = false; // next_scan only narrows, never re-caps
+                }
+
+                if attached.results.is_some() && ui.button("New Scan").clicked() {
+                    attached.results = None;
+                    attached.capped = false;
+                    attached.selected.clear();
                 }
             });
-        }
+
+            if let Some(err) = &self.input_error {
+                ui.colored_label(theme::ERROR, err);
+            }
+
+            let is_aob_results = matches!(attached.results, Some(Results::Aob(_)));
+            if attached.results.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label("Next scan filter:");
+                    if is_aob_results {
+                        egui::ComboBox::new("scan_filter", "")
+                            .selected_text(aob_filter_label(self.aob_filter))
+                            .show_ui(ui, |ui| {
+                                for filter in [AobFilter::Changed, AobFilter::Unchanged] {
+                                    ui.selectable_value(
+                                        &mut self.aob_filter,
+                                        filter,
+                                        aob_filter_label(filter),
+                                    );
+                                }
+                            });
+                    } else {
+                        egui::ComboBox::new("scan_filter", "")
+                            .selected_text(filter_label(self.filter))
+                            .show_ui(ui, |ui| {
+                                for filter in [
+                                    ScanFilter::Changed,
+                                    ScanFilter::Unchanged,
+                                    ScanFilter::Increased,
+                                    ScanFilter::Decreased,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.filter,
+                                        filter,
+                                        filter_label(filter),
+                                    );
+                                }
+                            });
+                    }
+
+                    if ui.button("Next Scan").clicked() {
+                        match &attached.results {
+                            Some(Results::Numeric(matches)) => {
+                                let updated = next_scan(&attached.session, matches, self.filter);
+                                attached.results = Some(Results::Numeric(updated));
+                            }
+                            Some(Results::Aob(matches)) => {
+                                let updated =
+                                    next_scan_aob(&attached.session, matches, self.aob_filter);
+                                attached.results = Some(Results::Aob(updated));
+                            }
+                            None => {}
+                        }
+                        attached.capped = false; // next_scan only narrows, never re-caps
+                    }
+                });
+            }
+        });
     }
 
     fn show_results_table(&mut self, ui: &mut egui::Ui) {
@@ -574,145 +590,148 @@ impl FerriteApp {
             return;
         }
 
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("New value:");
-            ui.text_edit_singleline(&mut self.edit_input_text);
-
-            let selected_count = attached.selected.len();
-            let set_clicked = ui
-                .add_enabled(selected_count > 0, egui::Button::new("Set Value"))
-                .clicked();
-            if set_clicked {
-                match parse_write_bytes(self.value_type, &self.edit_input_text) {
-                    Ok(bytes) => {
-                        for &address in &attached.selected {
-                            // A single address failing to write (e.g. the
-                            // page became unwritable) shouldn't stop the
-                            // rest of the batch.
-                            let _ = attached.session.write_bytes(address, &bytes);
-                            // A frozen address' target must move too, or
-                            // the freeze thread overwrites this write with
-                            // the old pinned bytes on its very next tick -
-                            // a silent revert the user has no way to see.
-                            if attached.freeze.is_frozen(address) {
-                                attached.freeze.freeze(address, bytes.clone());
-                            }
-                        }
-                        self.edit_input_error = None;
-                    }
-                    Err(err) => self.edit_input_error = Some(err),
-                }
-            }
-            ui.label(format!("({selected_count} selected)"));
-        });
-        if let Some(err) = &self.edit_input_error {
-            ui.colored_label(egui::Color32::RED, err);
-        }
-
-        let Attached {
-            freeze,
-            results,
-            selected,
-            capped,
-            ..
-        } = attached;
-        let Some(results) = results else {
-            return;
-        };
-
         let mut to_promote: Option<SavedRow> = None;
 
-        match results {
-            Results::Numeric(matches) => {
-                let shown = render_result_summary(ui, matches.len(), *capped);
-                egui::ScrollArea::vertical()
-                    .id_salt("results_table_scroll")
-                    .show(ui, |ui| {
-                        egui::Grid::new("results_table")
-                            .striped(true)
-                            .num_columns(5)
-                            .show(ui, |ui| {
-                                ui.strong("");
-                                ui.strong("Frozen");
-                                ui.strong("Address");
-                                ui.strong("Value");
-                                ui.strong("");
-                                ui.end_row();
+        theme::card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("New value:");
+                ui.text_edit_singleline(&mut self.edit_input_text);
 
-                                for m in matches.iter().take(shown) {
-                                    show_selection_checkbox(ui, selected, m.address);
-                                    show_frozen_checkbox(ui, freeze, m.address, || {
-                                        m.value.to_le_bytes()
-                                    });
-                                    ui.label(format!("{:#x}", m.address));
-                                    ui.label(format_value(m.value));
-                                    if ui.button("Add to saved list").clicked() {
-                                        to_promote = Some(SavedRow {
-                                            entry: CheatEntry {
-                                                description: format!(
-                                                    "{} @ {:#x}",
-                                                    format_value(m.value),
-                                                    m.address
-                                                ),
-                                                base: AddressExpr::Absolute(m.address),
-                                                pointer_offset: None,
-                                                value: EntryValue::Scalar(m.value),
-                                                frozen: false,
-                                            },
-                                            resolved_address: Some(m.address),
-                                            status: RowStatus::Resolved,
-                                        });
-                                    }
-                                    ui.end_row();
+                let selected_count = attached.selected.len();
+                let set_clicked = ui
+                    .add_enabled(selected_count > 0, egui::Button::new("Set Value"))
+                    .clicked();
+                if set_clicked {
+                    match parse_write_bytes(self.value_type, &self.edit_input_text) {
+                        Ok(bytes) => {
+                            for &address in &attached.selected {
+                                // A single address failing to write (e.g. the
+                                // page became unwritable) shouldn't stop the
+                                // rest of the batch.
+                                let _ = attached.session.write_bytes(address, &bytes);
+                                // A frozen address' target must move too, or
+                                // the freeze thread overwrites this write with
+                                // the old pinned bytes on its very next tick -
+                                // a silent revert the user has no way to see.
+                                if attached.freeze.is_frozen(address) {
+                                    attached.freeze.freeze(address, bytes.clone());
                                 }
-                            });
-                    });
+                            }
+                            self.edit_input_error = None;
+                        }
+                        Err(err) => self.edit_input_error = Some(err),
+                    }
+                }
+                ui.label(format!("({selected_count} selected)"));
+            });
+            if let Some(err) = &self.edit_input_error {
+                ui.colored_label(theme::ERROR, err);
             }
-            Results::Aob(matches) => {
-                let shown = render_result_summary(ui, matches.len(), *capped);
-                egui::ScrollArea::vertical()
-                    .id_salt("results_table_scroll")
-                    .show(ui, |ui| {
-                        egui::Grid::new("results_table")
-                            .striped(true)
-                            .num_columns(5)
-                            .show(ui, |ui| {
-                                ui.strong("");
-                                ui.strong("Frozen");
-                                ui.strong("Address");
-                                ui.strong("Bytes");
-                                ui.strong("");
-                                ui.end_row();
 
-                                for m in matches.iter().take(shown) {
-                                    show_selection_checkbox(ui, selected, m.address);
-                                    show_frozen_checkbox(ui, freeze, m.address, || m.bytes.clone());
-                                    ui.label(format!("{:#x}", m.address));
-                                    ui.label(format_pattern(&m.bytes));
-                                    if ui.button("Add to saved list").clicked() {
-                                        to_promote = Some(SavedRow {
-                                            entry: CheatEntry {
-                                                description: format!(
-                                                    "{} @ {:#x}",
-                                                    format_pattern(&m.bytes),
-                                                    m.address
-                                                ),
-                                                base: AddressExpr::Absolute(m.address),
-                                                pointer_offset: None,
-                                                value: EntryValue::Bytes(m.bytes.clone()),
-                                                frozen: false,
-                                            },
-                                            resolved_address: Some(m.address),
-                                            status: RowStatus::Resolved,
-                                        });
-                                    }
+            let Attached {
+                freeze,
+                results,
+                selected,
+                capped,
+                ..
+            } = attached;
+            let Some(results) = results else {
+                return;
+            };
+
+            match results {
+                Results::Numeric(matches) => {
+                    let shown = render_result_summary(ui, matches.len(), *capped);
+                    egui::ScrollArea::vertical()
+                        .id_salt("results_table_scroll")
+                        .show(ui, |ui| {
+                            egui::Grid::new("results_table")
+                                .striped(true)
+                                .num_columns(5)
+                                .show(ui, |ui| {
+                                    ui.strong("");
+                                    ui.strong("Frozen");
+                                    ui.strong("Address");
+                                    ui.strong("Value");
+                                    ui.strong("");
                                     ui.end_row();
-                                }
-                            });
-                    });
+
+                                    for m in matches.iter().take(shown) {
+                                        show_selection_checkbox(ui, selected, m.address);
+                                        show_frozen_checkbox(ui, freeze, m.address, || {
+                                            m.value.to_le_bytes()
+                                        });
+                                        ui.label(format!("{:#x}", m.address));
+                                        ui.label(format_value(m.value));
+                                        if ui.button("Add to saved list").clicked() {
+                                            to_promote = Some(SavedRow {
+                                                entry: CheatEntry {
+                                                    description: format!(
+                                                        "{} @ {:#x}",
+                                                        format_value(m.value),
+                                                        m.address
+                                                    ),
+                                                    base: AddressExpr::Absolute(m.address),
+                                                    pointer_offset: None,
+                                                    value: EntryValue::Scalar(m.value),
+                                                    frozen: false,
+                                                },
+                                                resolved_address: Some(m.address),
+                                                status: RowStatus::Resolved,
+                                            });
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+                Results::Aob(matches) => {
+                    let shown = render_result_summary(ui, matches.len(), *capped);
+                    egui::ScrollArea::vertical()
+                        .id_salt("results_table_scroll")
+                        .show(ui, |ui| {
+                            egui::Grid::new("results_table")
+                                .striped(true)
+                                .num_columns(5)
+                                .show(ui, |ui| {
+                                    ui.strong("");
+                                    ui.strong("Frozen");
+                                    ui.strong("Address");
+                                    ui.strong("Bytes");
+                                    ui.strong("");
+                                    ui.end_row();
+
+                                    for m in matches.iter().take(shown) {
+                                        show_selection_checkbox(ui, selected, m.address);
+                                        show_frozen_checkbox(ui, freeze, m.address, || {
+                                            m.bytes.clone()
+                                        });
+                                        ui.label(format!("{:#x}", m.address));
+                                        ui.label(format_pattern(&m.bytes));
+                                        if ui.button("Add to saved list").clicked() {
+                                            to_promote = Some(SavedRow {
+                                                entry: CheatEntry {
+                                                    description: format!(
+                                                        "{} @ {:#x}",
+                                                        format_pattern(&m.bytes),
+                                                        m.address
+                                                    ),
+                                                    base: AddressExpr::Absolute(m.address),
+                                                    pointer_offset: None,
+                                                    value: EntryValue::Bytes(m.bytes.clone()),
+                                                    frozen: false,
+                                                },
+                                                resolved_address: Some(m.address),
+                                                status: RowStatus::Resolved,
+                                            });
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
             }
-        }
+        });
 
         if let Some(row) = to_promote {
             self.saved.push(row);
@@ -724,51 +743,57 @@ impl FerriteApp {
     /// and the next refresh tick resolves it). See the vault's
     /// `v1-plan.md`.
     fn show_manual_add_form(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.heading("Add address manually");
-        ui.horizontal(|ui| {
-            ui.label("Description:");
-            ui.text_edit_singleline(&mut self.manual_description);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Address:");
-            ui.text_edit_singleline(&mut self.manual_address_text);
-            ui.label("Pointer offset (optional):");
-            ui.text_edit_singleline(&mut self.manual_pointer_offset_text);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Type:");
-            egui::ComboBox::new("manual_value_type", "")
-                .selected_text(self.manual_value_type.label())
-                .show_ui(ui, |ui| {
-                    for choice in ValueTypeChoice::ALL {
-                        ui.selectable_value(&mut self.manual_value_type, choice, choice.label());
+        egui::CollapsingHeader::new("Add address manually")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Description:");
+                    ui.text_edit_singleline(&mut self.manual_description);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Address:");
+                    ui.text_edit_singleline(&mut self.manual_address_text);
+                    ui.label("Pointer offset (optional):");
+                    ui.text_edit_singleline(&mut self.manual_pointer_offset_text);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Type:");
+                    egui::ComboBox::new("manual_value_type", "")
+                        .selected_text(self.manual_value_type.label())
+                        .show_ui(ui, |ui| {
+                            for choice in ValueTypeChoice::ALL {
+                                ui.selectable_value(
+                                    &mut self.manual_value_type,
+                                    choice,
+                                    choice.label(),
+                                );
+                            }
+                        });
+                    ui.label("Value:");
+                    ui.text_edit_singleline(&mut self.manual_value_text);
+
+                    if ui.button("Add").clicked() {
+                        match self.build_manual_entry() {
+                            Ok(entry) => {
+                                self.saved.push(SavedRow {
+                                    entry,
+                                    resolved_address: None,
+                                    status: RowStatus::NotAttached,
+                                });
+                                self.manual_description.clear();
+                                self.manual_address_text.clear();
+                                self.manual_pointer_offset_text.clear();
+                                self.manual_value_text.clear();
+                                self.manual_add_error = None;
+                            }
+                            Err(err) => self.manual_add_error = Some(err),
+                        }
                     }
                 });
-            ui.label("Value:");
-            ui.text_edit_singleline(&mut self.manual_value_text);
-
-            if ui.button("Add").clicked() {
-                match self.build_manual_entry() {
-                    Ok(entry) => {
-                        self.saved.push(SavedRow {
-                            entry,
-                            resolved_address: None,
-                            status: RowStatus::NotAttached,
-                        });
-                        self.manual_description.clear();
-                        self.manual_address_text.clear();
-                        self.manual_pointer_offset_text.clear();
-                        self.manual_value_text.clear();
-                        self.manual_add_error = None;
-                    }
-                    Err(err) => self.manual_add_error = Some(err),
+                if let Some(err) = &self.manual_add_error {
+                    ui.colored_label(theme::ERROR, err);
                 }
-            }
-        });
-        if let Some(err) = &self.manual_add_error {
-            ui.colored_label(egui::Color32::RED, err);
-        }
+            });
     }
 
     fn build_manual_entry(&self) -> Result<CheatEntry, String> {
@@ -805,59 +830,63 @@ impl FerriteApp {
     /// native file dialog for v1 (a decided simplification, see the vault's
     /// `v1-plan.md`).
     fn show_persistence_controls(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Table file:");
-            ui.text_edit_singleline(&mut self.table_path_text);
+        theme::card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Table file:");
+                ui.text_edit_singleline(&mut self.table_path_text);
 
-            if ui.button("Save").clicked() {
-                let entries: Vec<CheatEntry> = self.saved.iter().map(|r| r.entry.clone()).collect();
-                match save_table(&PathBuf::from(self.table_path_text.trim()), &entries) {
-                    Ok(()) => self.table_status = Some(format!("Saved {} entries.", entries.len())),
-                    Err(err) => self.table_status = Some(format!("Save failed: {err}")),
-                }
-            }
-            if ui.button("Load").clicked() {
-                match load_table(&PathBuf::from(self.table_path_text.trim())) {
-                    Ok(entries) => {
-                        self.table_status = Some(format!("Loaded {} entries.", entries.len()));
-                        self.saved = entries
-                            .into_iter()
-                            .map(|entry| SavedRow {
-                                entry,
-                                resolved_address: None,
-                                status: RowStatus::NotAttached,
-                            })
-                            .collect();
-                    }
-                    Err(err) => self.table_status = Some(format!("Load failed: {err}")),
-                }
-            }
-            if ui.button("Import .CT").clicked() {
-                match import_ct_file(&PathBuf::from(self.table_path_text.trim())) {
-                    Ok(report) => {
-                        self.table_status = Some(format!(
-                            "Imported {} entries ({} skipped — see below).",
-                            report.imported.len(),
-                            report.skipped.len()
-                        ));
-                        for entry in &report.imported {
-                            self.saved.push(SavedRow {
-                                entry: entry.clone(),
-                                resolved_address: None,
-                                status: RowStatus::NotAttached,
-                            });
+                if ui.button("Save").clicked() {
+                    let entries: Vec<CheatEntry> =
+                        self.saved.iter().map(|r| r.entry.clone()).collect();
+                    match save_table(&PathBuf::from(self.table_path_text.trim()), &entries) {
+                        Ok(()) => {
+                            self.table_status = Some(format!("Saved {} entries.", entries.len()))
                         }
-                        self.import_report = Some(report);
+                        Err(err) => self.table_status = Some(format!("Save failed: {err}")),
                     }
-                    Err(err) => self.table_status = Some(format!("Import failed: {err}")),
                 }
+                if ui.button("Load").clicked() {
+                    match load_table(&PathBuf::from(self.table_path_text.trim())) {
+                        Ok(entries) => {
+                            self.table_status = Some(format!("Loaded {} entries.", entries.len()));
+                            self.saved = entries
+                                .into_iter()
+                                .map(|entry| SavedRow {
+                                    entry,
+                                    resolved_address: None,
+                                    status: RowStatus::NotAttached,
+                                })
+                                .collect();
+                        }
+                        Err(err) => self.table_status = Some(format!("Load failed: {err}")),
+                    }
+                }
+                if ui.button("Import .CT").clicked() {
+                    match import_ct_file(&PathBuf::from(self.table_path_text.trim())) {
+                        Ok(report) => {
+                            self.table_status = Some(format!(
+                                "Imported {} entries ({} skipped — see below).",
+                                report.imported.len(),
+                                report.skipped.len()
+                            ));
+                            for entry in &report.imported {
+                                self.saved.push(SavedRow {
+                                    entry: entry.clone(),
+                                    resolved_address: None,
+                                    status: RowStatus::NotAttached,
+                                });
+                            }
+                            self.import_report = Some(report);
+                        }
+                        Err(err) => self.table_status = Some(format!("Import failed: {err}")),
+                    }
+                }
+            });
+            if let Some(status) = &self.table_status {
+                ui.label(status);
             }
+            self.show_import_report(ui);
         });
-        if let Some(status) = &self.table_status {
-            ui.label(status);
-        }
-        self.show_import_report(ui);
     }
 
     /// The visible unsupported-entries report `.CT` import must show, per
@@ -894,7 +923,7 @@ impl FerriteApp {
                     .show(ui, |ui| {
                         for skipped in &report.skipped {
                             ui.label(&skipped.description);
-                            ui.colored_label(egui::Color32::RED, &skipped.reason);
+                            ui.colored_label(theme::ERROR, &skipped.reason);
                             ui.end_row();
                         }
                     });
@@ -908,51 +937,59 @@ impl FerriteApp {
         if self.saved.is_empty() {
             return;
         }
-        ui.separator();
-        ui.heading("Saved list");
 
-        let freeze_handle = self.attached.as_ref().map(|a| &a.freeze);
         let mut to_remove: Option<usize> = None;
 
-        egui::ScrollArea::vertical()
-            .id_salt("saved_list_scroll")
-            .show(ui, |ui| {
-                egui::Grid::new("saved_list")
-                    .striped(true)
-                    .num_columns(5)
-                    .show(ui, |ui| {
-                        ui.strong("Description");
-                        ui.strong("Address");
-                        ui.strong("Value");
-                        ui.strong("Frozen");
-                        ui.strong("");
-                        ui.end_row();
+        theme::card().show(ui, |ui| {
+            ui.heading("Saved list");
 
-                        for (index, row) in self.saved.iter_mut().enumerate() {
-                            ui.text_edit_singleline(&mut row.entry.description);
+            let freeze_handle = self.attached.as_ref().map(|a| &a.freeze);
 
-                            let address_text = match (row.resolved_address, &row.status) {
-                                (Some(address), RowStatus::Resolved) => format!("{address:#x}"),
-                                (_, status) => status.label(),
-                            };
-                            ui.label(address_text);
-                            ui.label(format_entry_value(&row.entry.value));
-
-                            match freeze_handle {
-                                Some(freeze) => show_saved_frozen_checkbox(ui, freeze, row),
-                                None => {
-                                    let mut is_frozen = row.entry.frozen;
-                                    ui.add_enabled(false, egui::Checkbox::new(&mut is_frozen, ""));
-                                }
-                            }
-
-                            if ui.button("Remove").clicked() {
-                                to_remove = Some(index);
-                            }
+            egui::ScrollArea::vertical()
+                .id_salt("saved_list_scroll")
+                .show(ui, |ui| {
+                    egui::Grid::new("saved_list")
+                        .striped(true)
+                        .num_columns(5)
+                        .show(ui, |ui| {
+                            ui.strong("Description");
+                            ui.strong("Address");
+                            ui.strong("Value");
+                            ui.strong("Frozen");
+                            ui.strong("");
                             ui.end_row();
-                        }
-                    });
-            });
+
+                            for (index, row) in self.saved.iter_mut().enumerate() {
+                                ui.text_edit_singleline(&mut row.entry.description);
+
+                                let address_text = match (row.resolved_address, &row.status) {
+                                    (Some(address), RowStatus::Resolved) => {
+                                        format!("{address:#x}")
+                                    }
+                                    (_, status) => status.label(),
+                                };
+                                ui.label(address_text);
+                                ui.label(format_entry_value(&row.entry.value));
+
+                                match freeze_handle {
+                                    Some(freeze) => show_saved_frozen_checkbox(ui, freeze, row),
+                                    None => {
+                                        let mut is_frozen = row.entry.frozen;
+                                        ui.add_enabled(
+                                            false,
+                                            egui::Checkbox::new(&mut is_frozen, ""),
+                                        );
+                                    }
+                                }
+
+                                if ui.button("Remove").clicked() {
+                                    to_remove = Some(index);
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
 
         if let Some(index) = to_remove {
             let removed = self.saved.remove(index);
