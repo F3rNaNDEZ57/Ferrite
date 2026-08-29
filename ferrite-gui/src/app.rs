@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use ferrite_core::{
     AddressExpr, AobFilter, AobMatch, AttachError, CheatEntry, DEFAULT_FREEZE_INTERVAL, EntryValue,
-    FreezeHandle, ProcessInfo, ProcessSession, ResolveError, ScanFilter, ScanMatch, ScanOptions,
-    ScanValue, first_scan_aob, first_scan_exact, format_pattern, load_table, next_scan,
-    next_scan_aob, parse_address_expr, parse_hex_pattern, parse_hex_usize, resolve_address,
-    save_table,
+    FreezeHandle, ImportReport, ProcessInfo, ProcessSession, ResolveError, ScanFilter, ScanMatch,
+    ScanOptions, ScanValue, first_scan_aob, first_scan_exact, format_pattern, import_ct_file,
+    load_table, next_scan, next_scan_aob, parse_address_expr, parse_hex_pattern, parse_hex_usize,
+    resolve_address, save_table,
 };
 
 /// How many result rows the table actually renders. Independent of
@@ -191,6 +191,7 @@ pub struct FerriteApp {
     manual_add_error: Option<String>,
     table_path_text: String,
     table_status: Option<String>,
+    import_report: Option<ImportReport>,
 }
 
 impl FerriteApp {
@@ -217,6 +218,7 @@ impl FerriteApp {
             manual_add_error: None,
             table_path_text: String::new(),
             table_status: None,
+            import_report: None,
         }
     }
 
@@ -831,10 +833,72 @@ impl FerriteApp {
                     Err(err) => self.table_status = Some(format!("Load failed: {err}")),
                 }
             }
+            if ui.button("Import .CT").clicked() {
+                match import_ct_file(&PathBuf::from(self.table_path_text.trim())) {
+                    Ok(report) => {
+                        self.table_status = Some(format!(
+                            "Imported {} entries ({} skipped — see below).",
+                            report.imported.len(),
+                            report.skipped.len()
+                        ));
+                        for entry in &report.imported {
+                            self.saved.push(SavedRow {
+                                entry: entry.clone(),
+                                resolved_address: None,
+                                status: RowStatus::NotAttached,
+                            });
+                        }
+                        self.import_report = Some(report);
+                    }
+                    Err(err) => self.table_status = Some(format!("Import failed: {err}")),
+                }
+            }
         });
         if let Some(status) = &self.table_status {
             ui.label(status);
         }
+        self.show_import_report(ui);
+    }
+
+    /// The visible unsupported-entries report `.CT` import must show, per
+    /// the vault's `v1-scope.md` - every skipped entry with its description
+    /// and reason, not just a log line, plus the informational note about
+    /// entries that were frozen in the source table (see
+    /// `ImportReport::was_active_in_source` in `ferrite-core::ct_import`).
+    fn show_import_report(&mut self, ui: &mut egui::Ui) {
+        let Some(report) = &self.import_report else {
+            return;
+        };
+
+        if !report.was_active_in_source.is_empty() {
+            ui.label(format!(
+                "{} entries were active (frozen) in the source table; freeze is off after import - re-check them if you want that back.",
+                report.was_active_in_source.len()
+            ));
+        }
+
+        if report.skipped.is_empty() {
+            return;
+        }
+        ui.label(format!(
+            "{} entries couldn't be imported:",
+            report.skipped.len()
+        ));
+        egui::ScrollArea::vertical()
+            .id_salt("import_report_scroll")
+            .max_height(150.0)
+            .show(ui, |ui| {
+                egui::Grid::new("import_report")
+                    .striped(true)
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        for skipped in &report.skipped {
+                            ui.label(&skipped.description);
+                            ui.colored_label(egui::Color32::RED, &skipped.reason);
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 
     /// The saved-list panel: shows every saved entry with its live status,
