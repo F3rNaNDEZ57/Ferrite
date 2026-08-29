@@ -15,3 +15,6 @@ eframe = { version = "0.36.1", default-features = false, features = [
 ] }
 ferrite-core = { path = "../ferrite-core" }
 rfd = "0.17"
+
+[build-dependencies]
+winresource = "0.1"

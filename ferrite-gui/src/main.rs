@@ -4,11 +4,27 @@
 mod app;
 mod theme;
 
+/// Raw RGBA8 pixels (no header), pre-processed to exactly 64x64 - see the
+/// vault's `progress-log.md` for how this and `assets/ferrite.ico` (the
+/// exe's own embedded icon, set in `build.rs`) were both generated from
+/// the same source artwork. Embedding pre-decoded pixels avoids needing
+/// the `image` crate as a runtime dependency just to decode a PNG at
+/// startup.
+const ICON_RGBA_64: &[u8] = include_bytes!("../assets/icon_64.rgba");
+const ICON_SIZE: u32 = 64;
+
 fn main() -> eframe::Result {
+    let icon = eframe::egui::IconData {
+        rgba: ICON_RGBA_64.to_vec(),
+        width: ICON_SIZE,
+        height: ICON_SIZE,
+    };
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([900.0, 700.0])
-            .with_min_inner_size([700.0, 500.0]),
+            .with_min_inner_size([700.0, 500.0])
+            .with_icon(icon),
         ..Default::default()
     };
 
