@@ -433,6 +433,13 @@ impl FerriteApp {
                             // page became unwritable) shouldn't stop the
                             // rest of the batch.
                             let _ = attached.session.write_bytes(address, &bytes);
+                            // A frozen address' target must move too, or
+                            // the freeze thread overwrites this write with
+                            // the old pinned bytes on its very next tick -
+                            // a silent revert the user has no way to see.
+                            if attached.freeze.is_frozen(address) {
+                                attached.freeze.freeze(address, bytes.clone());
+                            }
                         }
                         self.edit_input_error = None;
                     }
