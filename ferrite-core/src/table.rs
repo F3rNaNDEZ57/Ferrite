@@ -10,7 +10,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::modules::{ModuleError, module_base};
-use crate::pointer::resolve_pointer;
+use crate::pointer::{MAX_POINTER_CHAIN_DEPTH, resolve_pointer_chain};
 use crate::scan_value::ScanValue;
 use crate::session::{MemoryError, ProcessSession};
 use crate::text::TextEncoding;
@@ -75,11 +75,12 @@ impl EntryValue {
 pub struct CheatEntry {
     pub description: String,
     pub base: AddressExpr,
-    /// `Some(offset)`: dereference `base` as a pointer-sized value, add
-    /// `offset` — the single-level pointer chain v1 supports (see the
-    /// vault's `v1-plan.md` for why this is exactly one dereference, not a
-    /// chain of any length).
-    pub pointer_offset: Option<usize>,
+    /// A pointer chain applied to `base`, in the same order a `.CT` file
+    /// lists its `<Offset>` elements. Empty means the address is direct —
+    /// not one dereference of offset zero. See
+    /// [`crate::pointer::resolve_pointer_chain`] for the walk order, which
+    /// runs from the last offset to the first.
+    pub pointer_offsets: Vec<usize>,
     /// The last-known/saved value. Also what a frozen entry is pinned to
     /// immediately on load — deterministic "restore this cheat" behavior,
     /// not a re-read of whatever's currently at the address (a decided
@@ -131,10 +132,9 @@ pub fn resolve_address(
         }
     };
 
-    match entry.pointer_offset {
-        Some(offset) => resolve_pointer(session, base, offset).map_err(ResolveError::Memory),
-        None => Ok(base),
-    }
+    // An empty chain returns `base` without reading anything, so the
+    // direct-address case needs no branch of its own here.
+    resolve_pointer_chain(session, base, &entry.pointer_offsets).map_err(ResolveError::Memory)
 }
 
 /// Parses an address expression as typed by a user (or, later, an imported
@@ -178,6 +178,33 @@ pub fn parse_hex_usize(text: &str) -> Option<usize> {
         .or_else(|| text.strip_prefix("0X"))
         .unwrap_or(text);
     usize::from_str_radix(text, 16).ok()
+}
+
+/// Parses a pointer chain as typed into the manual-add form: hex offsets
+/// separated by commas or whitespace, in the same order a `.CT` file lists
+/// its `<Offset>` elements. Empty input is an empty chain — a direct
+/// address, not a chain of one.
+///
+/// One field of separated tokens rather than a dynamic add/remove-row
+/// widget (a decided simplification, see the vault's `v0.2-plan.md`), and
+/// capped at [`MAX_POINTER_CHAIN_DEPTH`] like the `.CT` importer is.
+pub fn parse_pointer_offsets(text: &str) -> Result<Vec<usize>, String> {
+    let offsets = text
+        .split([',', ' ', '\t'])
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| {
+            parse_hex_usize(token)
+                .ok_or_else(|| format!("'{}' isn't a valid hex offset", token.trim()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if offsets.len() > MAX_POINTER_CHAIN_DEPTH {
+        return Err(format!(
+            "{} offsets is over the {MAX_POINTER_CHAIN_DEPTH}-level limit",
+            offsets.len()
+        ));
+    }
+    Ok(offsets)
 }
 
 /// Why saving or loading a table failed.
@@ -237,31 +264,31 @@ mod tests {
             CheatEntry {
                 description: "absolute i32".to_string(),
                 base: AddressExpr::Absolute(0x7FF6_A8EA_7000),
-                pointer_offset: None,
+                pointer_offsets: Vec::new(),
                 value: EntryValue::Scalar(ScanValue::I32(100)),
                 frozen: false,
             },
             CheatEntry {
-                description: "module-relative pointer".to_string(),
+                description: "module-relative two-level pointer".to_string(),
                 base: AddressExpr::ModuleRelative {
                     module: "ferrite-victim.exe".to_string(),
                     offset: 0x1000,
                 },
-                pointer_offset: Some(0x8),
+                pointer_offsets: vec![0x8, 0x20],
                 value: EntryValue::Scalar(ScanValue::F32(1.5)),
                 frozen: true,
             },
             CheatEntry {
                 description: "byte pattern".to_string(),
                 base: AddressExpr::Absolute(0x1234),
-                pointer_offset: None,
+                pointer_offsets: Vec::new(),
                 value: EntryValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]),
                 frozen: false,
             },
             CheatEntry {
                 description: "unicode name".to_string(),
                 base: AddressExpr::Absolute(0x5678),
-                pointer_offset: None,
+                pointer_offsets: Vec::new(),
                 value: EntryValue::Text {
                     bytes: vec![b'H', 0, b'i', 0, 0, 0],
                     encoding: TextEncoding::Utf16Le,
@@ -315,6 +342,43 @@ mod tests {
                 offset: 0x24BB438,
             })
         );
+    }
+
+    #[test]
+    fn parses_a_pointer_chain_separated_by_commas_or_spaces() {
+        assert_eq!(
+            parse_pointer_offsets("10,20,30"),
+            Ok(vec![0x10, 0x20, 0x30])
+        );
+        assert_eq!(
+            parse_pointer_offsets("10 20 30"),
+            Ok(vec![0x10, 0x20, 0x30])
+        );
+        assert_eq!(
+            parse_pointer_offsets(" 0x10, 20 ,30 "),
+            Ok(vec![0x10, 0x20, 0x30])
+        );
+    }
+
+    #[test]
+    fn an_empty_offsets_field_is_a_direct_address_not_a_chain_of_one() {
+        assert_eq!(parse_pointer_offsets(""), Ok(Vec::new()));
+        assert_eq!(parse_pointer_offsets("   "), Ok(Vec::new()));
+        // ...whereas an explicit zero really is a one-hop chain.
+        assert_eq!(parse_pointer_offsets("0"), Ok(vec![0]));
+    }
+
+    #[test]
+    fn rejects_a_bad_offset_and_an_over_deep_chain() {
+        assert!(parse_pointer_offsets("10,zz,30").is_err());
+        let too_deep = vec!["10"; MAX_POINTER_CHAIN_DEPTH + 1].join(",");
+        assert!(
+            parse_pointer_offsets(&too_deep)
+                .unwrap_err()
+                .contains("limit")
+        );
+        let at_limit = vec!["10"; MAX_POINTER_CHAIN_DEPTH].join(",");
+        assert!(parse_pointer_offsets(&at_limit).is_ok());
     }
 
     #[test]

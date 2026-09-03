@@ -13,7 +13,7 @@ use ferrite_core::{
     FreezeHandle, ImportReport, ProcessInfo, ProcessSession, ResolveError, ScanFilter, ScanMatch,
     ScanOptions, ScanValue, TextEncoding, decode_text, encode_text, extract_icon_rgba,
     first_scan_aob, first_scan_exact, format_pattern, import_ct_file, load_table, next_scan,
-    next_scan_aob, parse_address_expr, parse_hex_pattern, parse_hex_usize, resolve_address,
+    next_scan_aob, parse_address_expr, parse_hex_pattern, parse_pointer_offsets, resolve_address,
     save_table,
 };
 
@@ -270,7 +270,7 @@ pub struct FerriteApp {
     last_saved_refresh: Instant,
     manual_description: String,
     manual_address_text: String,
-    manual_pointer_offset_text: String,
+    manual_pointer_offsets_text: String,
     manual_value_type: ValueTypeChoice,
     manual_value_text: String,
     manual_add_error: Option<String>,
@@ -303,7 +303,7 @@ impl FerriteApp {
             last_saved_refresh: Instant::now(),
             manual_description: String::new(),
             manual_address_text: String::new(),
-            manual_pointer_offset_text: String::new(),
+            manual_pointer_offsets_text: String::new(),
             manual_value_type: ValueTypeChoice::I32,
             manual_value_text: String::new(),
             manual_add_error: None,
@@ -810,7 +810,7 @@ impl FerriteApp {
                                                         m.address
                                                     ),
                                                     base: AddressExpr::Absolute(m.address),
-                                                    pointer_offset: None,
+                                                    pointer_offsets: Vec::new(),
                                                     value: EntryValue::Scalar(m.value),
                                                     frozen: false,
                                                 },
@@ -858,7 +858,7 @@ impl FerriteApp {
                                                         m.address
                                                     ),
                                                     base: AddressExpr::Absolute(m.address),
-                                                    pointer_offset: None,
+                                                    pointer_offsets: Vec::new(),
                                                     value: value_type
                                                         .entry_value_from_bytes(m.bytes.clone()),
                                                     frozen: false,
@@ -895,8 +895,8 @@ impl FerriteApp {
                 ui.horizontal(|ui| {
                     ui.label("Address:");
                     ui.text_edit_singleline(&mut self.manual_address_text);
-                    ui.label("Pointer offset (optional):");
-                    ui.text_edit_singleline(&mut self.manual_pointer_offset_text);
+                    ui.label("Pointer offsets (optional):");
+                    ui.text_edit_singleline(&mut self.manual_pointer_offsets_text);
                 });
                 ui.horizontal(|ui| {
                     ui.label("Type:");
@@ -924,7 +924,7 @@ impl FerriteApp {
                                 });
                                 self.manual_description.clear();
                                 self.manual_address_text.clear();
-                                self.manual_pointer_offset_text.clear();
+                                self.manual_pointer_offsets_text.clear();
                                 self.manual_value_text.clear();
                                 self.manual_add_error = None;
                             }
@@ -940,18 +940,7 @@ impl FerriteApp {
 
     fn build_manual_entry(&self) -> Result<CheatEntry, String> {
         let base = parse_address_expr(&self.manual_address_text)?;
-        let pointer_offset = if self.manual_pointer_offset_text.trim().is_empty() {
-            None
-        } else {
-            Some(
-                parse_hex_usize(&self.manual_pointer_offset_text).ok_or_else(|| {
-                    format!(
-                        "'{}' isn't a valid hex offset",
-                        self.manual_pointer_offset_text
-                    )
-                })?,
-            )
-        };
+        let pointer_offsets = parse_pointer_offsets(&self.manual_pointer_offsets_text)?;
         let value = parse_entry_value(self.manual_value_type, &self.manual_value_text)?;
         let description = if self.manual_description.trim().is_empty() {
             self.manual_address_text.trim().to_string()
@@ -962,7 +951,7 @@ impl FerriteApp {
         Ok(CheatEntry {
             description,
             base,
-            pointer_offset,
+            pointer_offsets,
             value,
             frozen: false,
         })

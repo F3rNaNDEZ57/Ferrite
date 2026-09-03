@@ -28,7 +28,7 @@ pub use ct_import::{CtImportError, ImportReport, SkippedEntry, import_ct_file, i
 pub use freeze::{DEFAULT_FREEZE_INTERVAL, FreezeHandle};
 pub use icon::{IconRgba, extract_icon_rgba};
 pub use modules::{ModuleError, ModuleInfo, list_modules, module_base};
-pub use pointer::resolve_pointer;
+pub use pointer::{MAX_POINTER_CHAIN_DEPTH, resolve_pointer, resolve_pointer_chain};
 pub use process::{ProcessInfo, list_processes};
 pub use regions::MemoryRegion;
 pub use scan::{
@@ -38,6 +38,6 @@ pub use scan_value::{ScanFilter, ScanValue, bytes_match_exact, passes_filter};
 pub use session::{AttachError, MemoryError, ProcessSession};
 pub use table::{
     AddressExpr, CheatEntry, EntryValue, ResolveError, TableError, load_table, parse_address_expr,
-    parse_hex_usize, resolve_address, save_table,
+    parse_hex_usize, parse_pointer_offsets, resolve_address, save_table,
 };
 pub use text::{TextEncoding, decode_text, encode_text};

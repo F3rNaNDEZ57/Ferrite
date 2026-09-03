@@ -3,8 +3,8 @@
 //! (`MemoryRecordUnit.pas`/`CEFuncProc.pas` — see the vault's `v1-plan.md`
 //! for the full research), not guessed.
 //!
-//! Entries this can't represent (Lua scripts, structure dissect, multi-level
-//! pointer chains, codepage strings, unrecognized types, symbol/pointer-
+//! Entries this can't represent (Lua scripts, structure dissect, codepage
+//! strings, over-deep pointer chains, unrecognized types, symbol/pointer-
 //! expression addresses)
 //! go into a visible [`ImportReport`] rather than being silently dropped or
 //! mis-imported, per the vault's `v1-scope.md`.
@@ -13,6 +13,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::pointer::MAX_POINTER_CHAIN_DEPTH;
 use crate::scan_value::ScanValue;
 use crate::table::{CheatEntry, EntryValue, parse_address_expr, parse_hex_usize};
 use crate::text::TextEncoding;
@@ -249,23 +250,24 @@ fn import_leaf_entry(entry: &CheatEntryXml) -> Result<CheatEntry, String> {
         .as_ref()
         .map(|o| o.offset.as_slice())
         .unwrap_or(&[]);
-    let pointer_offset = match offsets.len() {
-        0 => None,
-        1 => Some(
-            parse_hex_usize(&offsets[0])
-                .ok_or_else(|| format!("invalid offset {:?}", offsets[0]))?,
-        ),
-        n => {
-            return Err(format!(
-                "multi-level pointer chain ({n} offsets) isn't supported"
-            ));
-        }
-    };
+    if offsets.len() > MAX_POINTER_CHAIN_DEPTH {
+        return Err(format!(
+            "pointer chain of {} offsets is over the {MAX_POINTER_CHAIN_DEPTH}-level limit",
+            offsets.len()
+        ));
+    }
+    // Kept in document order - the order Cheat Engine both reads and writes
+    // them in. The last-to-first walk lives in `resolve_pointer_chain`, not
+    // in how they're stored, so there's nothing to reverse here.
+    let pointer_offsets = offsets
+        .iter()
+        .map(|text| parse_hex_usize(text).ok_or_else(|| format!("invalid offset {text:?}")))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(CheatEntry {
         description: String::new(), // filled in by the caller
         base,
-        pointer_offset,
+        pointer_offsets,
         value,
         frozen: false, // see ImportReport::was_active_in_source
     })
@@ -499,23 +501,51 @@ mod tests {
     }
 
     #[test]
+    fn an_over_deep_pointer_chain_is_reported_rather_than_walked() {
+        let offsets = "<Offset>10</Offset>".repeat(MAX_POINTER_CHAIN_DEPTH + 1);
+        let report = import_ct_xml(&one_entry_table(&format!(
+            "<VariableType>4 Bytes</VariableType><Offsets>{offsets}</Offsets>"
+        )))
+        .expect("parsing");
+        assert_eq!(report.imported.len(), 0);
+        assert!(
+            report.skipped[0].reason.contains("limit"),
+            "got: {}",
+            report.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn a_chain_exactly_at_the_depth_limit_still_imports() {
+        let offsets = "<Offset>10</Offset>".repeat(MAX_POINTER_CHAIN_DEPTH);
+        let report = import_ct_xml(&one_entry_table(&format!(
+            "<VariableType>4 Bytes</VariableType><Offsets>{offsets}</Offsets>"
+        )))
+        .expect("parsing");
+        assert_eq!(
+            report.imported[0].pointer_offsets.len(),
+            MAX_POINTER_CHAIN_DEPTH
+        );
+    }
+
+    #[test]
     fn basic_table_imports_supported_entries_and_reports_the_rest() {
         let report =
             import_ct_xml(&load_fixture("basic_table.CT")).expect("parsing basic_table.CT");
 
         // Imported: the two grouped entries, the absolute byte, the
-        // single-level pointer, the was-activated entry, and the four
-        // string entries = 9.
+        // single-level pointer, the was-activated entry, the four string
+        // entries, and the three-level pointer chain = 10.
         assert_eq!(
             report.imported.len(),
-            9,
+            10,
             "unexpected imported set: {:#?}",
             report.imported
         );
-        // Skipped: multi-level chain, bracket address, unknown type = 3.
+        // Skipped: bracket address, unknown type = 2.
         assert_eq!(
             report.skipped.len(),
-            3,
+            2,
             "unexpected skipped set: {:#?}",
             report.skipped
         );
@@ -557,8 +587,20 @@ mod tests {
             .imported
             .iter()
             .find(|e| e.description == "Single-level pointer")
-            .expect("exactly one Offset should import as pointer_offset");
-        assert_eq!(single_pointer.pointer_offset, Some(0x10));
+            .expect("one Offset should import as a one-element chain");
+        assert_eq!(single_pointer.pointer_offsets, vec![0x10]);
+
+        // Document order, not reversed on read: the fixture lists 10, 20,
+        // 30 and that's how they're stored. The last-to-first *walk* is
+        // `resolve_pointer_chain`'s business, and reversing here as well
+        // would cancel it out into a chain that resolves silently to the
+        // wrong address.
+        let multi_level = report
+            .imported
+            .iter()
+            .find(|e| e.description == "Multi-level pointer chain")
+            .expect("a 3-offset entry should import now, not be skipped");
+        assert_eq!(multi_level.pointer_offsets, vec![0x10, 0x20, 0x30]);
 
         let was_frozen = report
             .imported
@@ -572,17 +614,6 @@ mod tests {
         assert_eq!(
             report.was_active_in_source,
             vec!["Was frozen in the source table".to_string()]
-        );
-
-        let multi_level = report
-            .skipped
-            .iter()
-            .find(|s| s.description == "Multi-level pointer chain")
-            .expect("a 3-offset entry should be skipped, not truncated to 1");
-        assert!(
-            multi_level.reason.contains('3'),
-            "reason should mention the real offset count (3), got: {}",
-            multi_level.reason
         );
 
         let bracket = report
