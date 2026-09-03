@@ -10,6 +10,48 @@ Pre-1.0, a minor version bump may carry a breaking change — see `0.2.0`.
 
 Nothing yet.
 
+## [0.3.0] — 2026-09-04
+
+[Release](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v0.3.0)
+
+No breaking changes — tables saved by `0.2.0` load unchanged.
+
+### Added
+
+- **`.CT` import: `Pointer` entries.** A pointer isn't a distinct shape —
+  Cheat Engine's own `setVarType` rewrites `vtPointer` to `vtQword` /
+  `vtDword` and turns `ShowAsHex` on. It's an address-sized integer shown
+  in hex, always the 8-byte form here since Ferrite is 64-bit only.
+- **`.CT` import: `Array of byte` entries**, sized by `<ByteLength>`
+  (decimal). Imported as the same byte-buffer shape an AOB scan produces,
+  so the value displays as a hex pattern that pastes straight back into
+  the AOB search box.
+- **`<ShowAsHex>` support**, for any numeric entry rather than only
+  pointers. `CheatEntry` gains `show_as_hex`, additive and defaulted, so
+  no saved table needs migrating. Display only — a saved entry's value is
+  rendered, never parsed back from the row, so there's no ambiguity about
+  which base typed input would be in. Floats render their bit pattern,
+  matching CE's treatment of a hex-displayed value as an integer "even for
+  the float types".
+
+### Changed
+
+- `<VariableType>` now matches case-insensitively and trimmed, mirroring
+  Cheat Engine's own `StringToVariableType` (`s := trim(lowercase(s))`).
+  Reports still quote the original text, so an unrecognized type is named
+  as the file actually wrote it.
+
+### Notes on Cheat Engine compatibility
+
+- CE reads `<ShowAsHex>` *before* it applies `<VariableType>`, and
+  `setVarType` then forces hex on for a pointer — so the type wins over an
+  explicit `<ShowAsHex>0</ShowAsHex>`, not the other way round.
+
+Both types had been skipped since `0.1.0` with reasons saying their
+structure wasn't verified against a real table. That blocker was cleared
+while verifying the string details for `0.2.0`, which is why they land
+now.
+
 ## [0.2.0] — 2026-09-04
 
 [Release](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v0.2.0)
@@ -97,6 +139,7 @@ load a cheat table**.
 - Process-list icons, native file dialogs, a dark theme, and the
   application's own icon.
 
-[Unreleased]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v0.1.0

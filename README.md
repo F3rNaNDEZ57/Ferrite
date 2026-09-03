@@ -12,7 +12,7 @@ by construction, and maintained in the open.
 
 ## Status
 
-**v0.2.0 is out.** The full core loop works and is verified against a real
+**v0.3.0 is out.** The full core loop works and is verified against a real
 target process: **attach → scan → filter (next scan) → edit / freeze →
 save & load a cheat table** (our own JSON format, plus importing existing
 Cheat Engine `.CT` tables).
@@ -29,11 +29,13 @@ Cheat Engine `.CT` tables).
   address manually (module-relative or absolute, with an optional
   multi-level pointer chain).
 - Save/load your own cheat table as plain JSON, or import a real Cheat
-  Engine `.CT` file. Multi-level pointer entries and string entries import
-  properly; entries Ferrite still can't represent are reported visibly,
-  never silently dropped or guessed at — and a skipped Auto Assembler /
-  Lua entry now shows you its script text, so you can read what it would
-  have done before deciding to trust it. Ferrite never executes it.
+  Engine `.CT` file. Multi-level pointer chains, string entries, `Pointer`
+  and `Array of byte` entries all import properly, and `<ShowAsHex>` is
+  honoured. Entries Ferrite still can't represent — bit-fields, custom
+  Lua-converted types, script entries — are reported visibly, never
+  silently dropped or guessed at, and a skipped Auto Assembler / Lua entry
+  shows you its script text so you can read what it would have done before
+  deciding to trust it. Ferrite never executes it.
 
 Known limitation: Windows-only, 64-bit targets only. See the Roadmap
 section for what's still deferred.
