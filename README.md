@@ -38,6 +38,8 @@ Cheat Engine `.CT` tables).
 Known limitation: Windows-only, 64-bit targets only. See the Roadmap
 section for what's still deferred.
 
+Release notes for each version are in [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Workspace layout
 
 - [`ferrite-core`](ferrite-core) — GUI-free core: process attach, memory
