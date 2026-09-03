@@ -1,7 +1,8 @@
 //! Exercises the freeze thread against a real separate process: pinning a
 //! frozen address against an external write while leaving an unfrozen
-//! address alone, unfreezing actually stopping the rewrites, and detecting
-//! that the target process exited.
+//! address alone, unfreezing actually stopping the rewrites, detecting
+//! that the target process exited, and pinning a whole fixed-width string
+//! buffer rather than just the part of it that currently holds text.
 
 mod common;
 
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::Victim;
-use ferrite_core::ProcessSession;
+use ferrite_core::{EntryValue, ProcessSession, TextEncoding, decode_text};
 
 /// Fast enough to keep the tests quick, slow enough that a single sleep
 /// comfortably spans several ticks.
@@ -110,5 +111,58 @@ fn freeze_detects_the_target_process_exiting() {
     assert!(
         freeze.target_exited(),
         "freeze thread should have detected the target process exiting within the timeout"
+    );
+}
+
+#[test]
+fn freezing_a_string_entry_pins_its_whole_fixed_width_buffer() {
+    // A `Text` entry freezes on `EntryValue::to_le_bytes()`, which is the
+    // full declared buffer - so an external write of *shorter* text must be
+    // undone across the entire width, not just the bytes the new text
+    // happened to touch. Nothing else exercises freeze on a Text value:
+    // the GUI's own live click-through covered display and refresh, not
+    // this.
+    let victim = Victim::spawn();
+    let session =
+        Arc::new(ProcessSession::attach(victim.pid()).expect("attaching to the victim process"));
+    let address = victim.address_of("STR_ASCII");
+
+    // The victim's buffer as it starts: "FerriteVictim" NUL-padded to 32.
+    const BUFFER_LEN: usize = 32;
+    let original = session
+        .read_bytes(address, BUFFER_LEN)
+        .expect("reading STR_ASCII");
+    let entry = EntryValue::Text {
+        bytes: original.clone(),
+        encoding: TextEncoding::Latin1,
+        zero_terminated: true,
+    };
+    assert_eq!(
+        decode_text(&entry.to_le_bytes(), TextEncoding::Latin1, true),
+        "FerriteVictim"
+    );
+
+    let freeze = session.start_freeze_thread(TEST_FREEZE_INTERVAL);
+    freeze.freeze(address, entry.to_le_bytes());
+
+    // An external write of shorter text: this leaves "iteVictim" trailing
+    // in the buffer, so restoring only the written prefix would leave a
+    // corrupted string behind and still look like the freeze worked.
+    session
+        .write_bytes(address, b"Zap\0")
+        .expect("external write to STR_ASCII");
+
+    wait_for_a_few_ticks();
+
+    let restored = session
+        .read_bytes(address, BUFFER_LEN)
+        .expect("reading STR_ASCII back");
+    assert_eq!(
+        restored, original,
+        "freeze should restore the whole {BUFFER_LEN}-byte buffer"
+    );
+    assert_eq!(
+        decode_text(&restored, TextEncoding::Latin1, true),
+        "FerriteVictim"
     );
 }
