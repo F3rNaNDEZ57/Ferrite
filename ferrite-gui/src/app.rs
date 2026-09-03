@@ -11,9 +11,10 @@ use crate::theme;
 use ferrite_core::{
     AddressExpr, AobFilter, AobMatch, AttachError, CheatEntry, DEFAULT_FREEZE_INTERVAL, EntryValue,
     FreezeHandle, ImportReport, ProcessInfo, ProcessSession, ResolveError, ScanFilter, ScanMatch,
-    ScanOptions, ScanValue, decode_text, extract_icon_rgba, first_scan_aob, first_scan_exact,
-    format_pattern, import_ct_file, load_table, next_scan, next_scan_aob, parse_address_expr,
-    parse_hex_pattern, parse_hex_usize, resolve_address, save_table,
+    ScanOptions, ScanValue, TextEncoding, decode_text, encode_text, extract_icon_rgba,
+    first_scan_aob, first_scan_exact, format_pattern, import_ct_file, load_table, next_scan,
+    next_scan_aob, parse_address_expr, parse_hex_pattern, parse_hex_usize, resolve_address,
+    save_table,
 };
 
 /// How many result rows the table actually renders. Independent of
@@ -38,10 +39,12 @@ enum ValueTypeChoice {
     F32,
     F64,
     Aob,
+    Text,
+    UnicodeText,
 }
 
 impl ValueTypeChoice {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 9] = [
         Self::I8,
         Self::I16,
         Self::I32,
@@ -49,6 +52,8 @@ impl ValueTypeChoice {
         Self::F32,
         Self::F64,
         Self::Aob,
+        Self::Text,
+        Self::UnicodeText,
     ];
 
     fn label(self) -> &'static str {
@@ -60,12 +65,69 @@ impl ValueTypeChoice {
             Self::F32 => "f32",
             Self::F64 => "f64",
             Self::Aob => "AOB (bytes)",
+            // Cheat Engine's own names for these two, so a user who knows
+            // where a value came from recognizes the type here.
+            Self::Text => "String",
+            Self::UnicodeText => "Unicode String",
         }
     }
 
-    /// Parses a numeric value. Never called for `Aob` — that variant goes
-    /// through `parse_hex_pattern` instead, since a byte pattern isn't a
-    /// `ScanValue`.
+    /// The text encoding this type scans and displays in, or `None` for the
+    /// types that aren't text.
+    fn text_encoding(self) -> Option<TextEncoding> {
+        match self {
+            Self::Text => Some(TextEncoding::Latin1),
+            Self::UnicodeText => Some(TextEncoding::Utf16Le),
+            _ => None,
+        }
+    }
+
+    /// Whether this type searches for a run of bytes rather than a
+    /// fixed-width number — true for `Aob` and for both string types, since
+    /// a string scan *is* a byte-pattern search (the encoded text is the
+    /// pattern). That's why both route through the same scan engine rather
+    /// than a second one.
+    fn scans_as_bytes(self) -> bool {
+        self == Self::Aob || self.text_encoding().is_some()
+    }
+
+    /// Turns the search box's text into the bytes to look for.
+    fn parse_pattern(self, text: &str) -> Result<Vec<u8>, String> {
+        match self.text_encoding() {
+            Some(encoding) => encode_text(text, encoding),
+            None => parse_hex_pattern(text),
+        }
+    }
+
+    /// Renders matched bytes for the results table. A scan match is exactly
+    /// as long as the pattern searched for, so there's no NUL padding to
+    /// truncate here — unlike a saved entry, which has a declared buffer
+    /// width and carries its own zero-terminate flag.
+    fn format_bytes(self, bytes: &[u8]) -> String {
+        match self.text_encoding() {
+            Some(encoding) => format!("{:?}", decode_text(bytes, encoding, false)),
+            None => format_pattern(bytes),
+        }
+    }
+
+    /// The saved-list value a result of this type promotes to. A promoted
+    /// string's buffer is the match itself, so `zero_terminated` starts
+    /// `false`: there's nothing past the text to truncate at, and setting it
+    /// would instead hide any NUL that later appears inside the buffer.
+    fn entry_value_from_bytes(self, bytes: Vec<u8>) -> EntryValue {
+        match self.text_encoding() {
+            Some(encoding) => EntryValue::Text {
+                bytes,
+                encoding,
+                zero_terminated: false,
+            },
+            None => EntryValue::Bytes(bytes),
+        }
+    }
+
+    /// Parses a numeric value. Never called for the byte-pattern types —
+    /// those go through [`Self::parse_pattern`] instead, since neither a hex
+    /// pattern nor a string is a `ScanValue`.
     fn parse(self, text: &str) -> Result<ScanValue, String> {
         let text = text.trim();
         let parsed = match self {
@@ -75,9 +137,10 @@ impl ValueTypeChoice {
             Self::I64 => text.parse().ok().map(ScanValue::I64),
             Self::F32 => text.parse().ok().map(ScanValue::F32),
             Self::F64 => text.parse().ok().map(ScanValue::F64),
-            Self::Aob => {
-                unreachable!("Aob is parsed via parse_hex_pattern, not ValueTypeChoice::parse")
-            }
+            Self::Aob | Self::Text | Self::UnicodeText => unreachable!(
+                "{} is parsed via parse_pattern, not ValueTypeChoice::parse",
+                self.label()
+            ),
         };
         parsed.ok_or_else(|| format!("'{text}' isn't a valid {}", self.label()))
     }
@@ -546,13 +609,17 @@ impl FerriteApp {
                     attached.selected.clear();
                 }
 
-                let is_aob = self.value_type == ValueTypeChoice::Aob;
-                ui.label(if is_aob { "Pattern:" } else { "Value:" });
+                let scans_as_bytes = self.value_type.scans_as_bytes();
+                ui.label(match self.value_type.text_encoding() {
+                    Some(_) => "Text:",
+                    None if scans_as_bytes => "Pattern:",
+                    None => "Value:",
+                });
                 ui.text_edit_singleline(&mut self.input_text);
 
                 if ui.button("First Scan").clicked() {
-                    if is_aob {
-                        match parse_hex_pattern(&self.input_text) {
+                    if scans_as_bytes {
+                        match self.value_type.parse_pattern(&self.input_text) {
                             Ok(pattern) => {
                                 let result = first_scan_aob(
                                     &attached.session,
@@ -649,6 +716,11 @@ impl FerriteApp {
     }
 
     fn show_results_table(&mut self, ui: &mut egui::Ui) {
+        // How byte matches are displayed and promoted depends on which type
+        // produced them, and `AobMatch` doesn't carry that. Reading it from
+        // the scan panel is safe because switching types clears the results
+        // it would otherwise be misapplied to.
+        let value_type = self.value_type;
         let Some(attached) = &mut self.attached else {
             return;
         };
@@ -763,7 +835,10 @@ impl FerriteApp {
                                     ui.strong("");
                                     ui.strong("Frozen");
                                     ui.strong("Address");
-                                    ui.strong("Bytes");
+                                    ui.strong(match value_type.text_encoding() {
+                                        Some(_) => "Text",
+                                        None => "Bytes",
+                                    });
                                     ui.strong("");
                                     ui.end_row();
 
@@ -773,18 +848,19 @@ impl FerriteApp {
                                             m.bytes.clone()
                                         });
                                         ui.label(format!("{:#x}", m.address));
-                                        ui.label(format_pattern(&m.bytes));
+                                        ui.label(value_type.format_bytes(&m.bytes));
                                         if ui.button("Add to saved list").clicked() {
                                             to_promote = Some(SavedRow {
                                                 entry: CheatEntry {
                                                     description: format!(
                                                         "{} @ {:#x}",
-                                                        format_pattern(&m.bytes),
+                                                        value_type.format_bytes(&m.bytes),
                                                         m.address
                                                     ),
                                                     base: AddressExpr::Absolute(m.address),
                                                     pointer_offset: None,
-                                                    value: EntryValue::Bytes(m.bytes.clone()),
+                                                    value: value_type
+                                                        .entry_value_from_bytes(m.bytes.clone()),
                                                     frozen: false,
                                                 },
                                                 resolved_address: Some(m.address),
@@ -1150,8 +1226,8 @@ fn show_saved_frozen_checkbox(ui: &mut egui::Ui, freeze: &FreezeHandle, row: &mu
 /// "Set Value" - `First Scan` has its own parse step because it also needs
 /// the typed `ScanValue`/pattern, not just bytes.
 fn parse_write_bytes(value_type: ValueTypeChoice, text: &str) -> Result<Vec<u8>, String> {
-    if value_type == ValueTypeChoice::Aob {
-        parse_hex_pattern(text)
+    if value_type.scans_as_bytes() {
+        value_type.parse_pattern(text)
     } else {
         value_type.parse(text).map(ScanValue::to_le_bytes)
     }
@@ -1163,8 +1239,10 @@ fn parse_write_bytes(value_type: ValueTypeChoice, text: &str) -> Result<Vec<u8>,
 /// since a saved entry needs to remember its own shape (for live-refresh
 /// re-interpretation and for display).
 fn parse_entry_value(value_type: ValueTypeChoice, text: &str) -> Result<EntryValue, String> {
-    if value_type == ValueTypeChoice::Aob {
-        parse_hex_pattern(text).map(EntryValue::Bytes)
+    if value_type.scans_as_bytes() {
+        value_type
+            .parse_pattern(text)
+            .map(|bytes| value_type.entry_value_from_bytes(bytes))
     } else {
         value_type.parse(text).map(EntryValue::Scalar)
     }
