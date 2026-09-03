@@ -18,6 +18,7 @@ pub mod scan;
 pub mod scan_value;
 pub mod session;
 pub mod table;
+pub mod text;
 
 pub use aob::{
     AobFilter, AobMatch, AobScanResult, first_scan_aob, format_pattern, next_scan_aob,
@@ -39,3 +40,4 @@ pub use table::{
     AddressExpr, CheatEntry, EntryValue, ResolveError, TableError, load_table, parse_address_expr,
     parse_hex_usize, resolve_address, save_table,
 };
+pub use text::{TextEncoding, decode_text, encode_text};

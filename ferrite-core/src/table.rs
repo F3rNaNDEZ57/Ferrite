@@ -13,6 +13,7 @@ use crate::modules::{ModuleError, module_base};
 use crate::pointer::resolve_pointer;
 use crate::scan_value::ScanValue;
 use crate::session::{MemoryError, ProcessSession};
+use crate::text::TextEncoding;
 
 /// How a saved entry's address is expressed.
 ///
@@ -29,22 +30,42 @@ pub enum AddressExpr {
     ModuleRelative { module: String, offset: usize },
 }
 
-/// A saved entry's value: either a numeric [`ScanValue`], or a fixed-length
-/// byte array (an AOB-shaped entry — mirrors [`crate::aob::AobMatch`]'s
-/// shape rather than pretending to be numeric).
+/// A saved entry's value: a numeric [`ScanValue`], a fixed-length byte
+/// array (an AOB-shaped entry — mirrors [`crate::aob::AobMatch`]'s shape
+/// rather than pretending to be numeric), or text.
+///
+/// `Text` is deliberately distinct from `Bytes` even though both are byte
+/// buffers underneath: they need different *display*, and only the value
+/// itself knows which it is. A `Bytes` entry shows as a hex pattern that
+/// can be pasted back into the AOB search box; a `Text` entry shows as
+/// decoded text, so it has to carry the encoding and the zero-terminate
+/// display flag with it rather than depending on whatever type the scan
+/// panel happens to have selected.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EntryValue {
     Scalar(ScanValue),
     Bytes(Vec<u8>),
+    /// A fixed-length string buffer. `bytes.len()` *is* the declared length
+    /// — set once at creation or import and never re-derived from memory,
+    /// so a refresh re-reads exactly this many bytes (see the vault's
+    /// `v0.2-plan.md`). `zero_terminated` is display-only: it truncates the
+    /// decoded text at the first NUL inside the buffer, it never shortens
+    /// the buffer or what gets read or written.
+    Text {
+        bytes: Vec<u8>,
+        encoding: TextEncoding,
+        zero_terminated: bool,
+    },
 }
 
 impl EntryValue {
     /// This value's little-endian byte representation — what freeze pins an
-    /// address to.
+    /// address to, and (via its length) how many bytes a live refresh
+    /// re-reads.
     pub fn to_le_bytes(&self) -> Vec<u8> {
         match self {
             Self::Scalar(v) => v.to_le_bytes(),
-            Self::Bytes(bytes) => bytes.clone(),
+            Self::Bytes(bytes) | Self::Text { bytes, .. } => bytes.clone(),
         }
     }
 }
@@ -235,6 +256,17 @@ mod tests {
                 base: AddressExpr::Absolute(0x1234),
                 pointer_offset: None,
                 value: EntryValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                frozen: false,
+            },
+            CheatEntry {
+                description: "unicode name".to_string(),
+                base: AddressExpr::Absolute(0x5678),
+                pointer_offset: None,
+                value: EntryValue::Text {
+                    bytes: vec![b'H', 0, b'i', 0, 0, 0],
+                    encoding: TextEncoding::Utf16Le,
+                    zero_terminated: true,
+                },
                 frozen: false,
             },
         ]

@@ -11,9 +11,9 @@ use crate::theme;
 use ferrite_core::{
     AddressExpr, AobFilter, AobMatch, AttachError, CheatEntry, DEFAULT_FREEZE_INTERVAL, EntryValue,
     FreezeHandle, ImportReport, ProcessInfo, ProcessSession, ResolveError, ScanFilter, ScanMatch,
-    ScanOptions, ScanValue, extract_icon_rgba, first_scan_aob, first_scan_exact, format_pattern,
-    import_ct_file, load_table, next_scan, next_scan_aob, parse_address_expr, parse_hex_pattern,
-    parse_hex_usize, resolve_address, save_table,
+    ScanOptions, ScanValue, decode_text, extract_icon_rgba, first_scan_aob, first_scan_exact,
+    format_pattern, import_ct_file, load_table, next_scan, next_scan_aob, parse_address_expr,
+    parse_hex_pattern, parse_hex_usize, resolve_address, save_table,
 };
 
 /// How many result rows the table actually renders. Independent of
@@ -90,6 +90,19 @@ fn reinterpret_entry_value(previous: &EntryValue, bytes: &[u8]) -> EntryValue {
     match previous {
         EntryValue::Scalar(v) => EntryValue::Scalar(v.from_le_bytes_like(bytes)),
         EntryValue::Bytes(_) => EntryValue::Bytes(bytes.to_vec()),
+        // Encoding and zero-terminate are properties of the *entry*, not of
+        // whatever bytes happen to be at the address this tick - only the
+        // buffer contents are new. The buffer length comes along unchanged
+        // too, since the caller reads `to_le_bytes().len()` bytes.
+        EntryValue::Text {
+            encoding,
+            zero_terminated,
+            ..
+        } => EntryValue::Text {
+            bytes: bytes.to_vec(),
+            encoding: *encoding,
+            zero_terminated: *zero_terminated,
+        },
     }
 }
 
@@ -97,6 +110,13 @@ fn format_entry_value(value: &EntryValue) -> String {
     match value {
         EntryValue::Scalar(v) => format_value(*v),
         EntryValue::Bytes(bytes) => format_pattern(bytes),
+        // Quoted, so trailing NUL padding on a non-zero-terminated buffer
+        // is visible as width rather than looking like a shorter string.
+        EntryValue::Text {
+            bytes,
+            encoding,
+            zero_terminated,
+        } => format!("{:?}", decode_text(bytes, *encoding, *zero_terminated)),
     }
 }
 
