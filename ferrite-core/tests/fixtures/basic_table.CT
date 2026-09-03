@@ -97,6 +97,36 @@
       <Address>"game.exe"+6300</Address>
     </CheatEntry>
     <CheatEntry>
+      <ID>14</ID>
+      <Description>"Signature (array of byte)"</Description>
+      <LastState/>
+      <VariableType>Array of byte</VariableType>
+      <ByteLength>6</ByteLength>
+      <Address>"game.exe"+6400</Address>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>15</ID>
+      <Description>"Player base (pointer)"</Description>
+      <LastState/>
+      <VariableType>Pointer</VariableType>
+      <Address>"game.exe"+6500</Address>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>16</ID>
+      <Description>"Flags (shown as hex)"</Description>
+      <LastState/>
+      <VariableType>4 Bytes</VariableType>
+      <ShowAsHex>1</ShowAsHex>
+      <Address>"game.exe"+6600</Address>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>17</ID>
+      <Description>"Lowercase type name"</Description>
+      <LastState/>
+      <VariableType>4 bytes</VariableType>
+      <Address>"game.exe"+6700</Address>
+    </CheatEntry>
+    <CheatEntry>
       <ID>9</ID>
       <Description>"Injected pointer expression"</Description>
       <LastState/>

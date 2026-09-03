@@ -169,8 +169,12 @@ fn reinterpret_entry_value(previous: &EntryValue, bytes: &[u8]) -> EntryValue {
     }
 }
 
-fn format_entry_value(value: &EntryValue) -> String {
+/// Renders a saved entry's value for its row. `show_as_hex` only affects
+/// numeric values - a byte pattern is already hex, and text has no
+/// meaningful hex rendering that a user would want in place of the text.
+fn format_entry_value(value: &EntryValue, show_as_hex: bool) -> String {
     match value {
+        EntryValue::Scalar(v) if show_as_hex => format_scalar_hex(*v),
         EntryValue::Scalar(v) => format_value(*v),
         EntryValue::Bytes(bytes) => format_pattern(bytes),
         // Quoted, so trailing NUL padding on a non-zero-terminated buffer
@@ -181,6 +185,17 @@ fn format_entry_value(value: &EntryValue) -> String {
             zero_terminated,
         } => format!("{:?}", decode_text(bytes, *encoding, *zero_terminated)),
     }
+}
+
+/// Renders a numeric value's raw little-endian bytes as a hex integer of
+/// that type's width. Floats included: Cheat Engine treats a hex-displayed
+/// value as an integer "even for the float types", so an `f32` shows its
+/// bit pattern rather than a decimal that hex couldn't represent anyway.
+fn format_scalar_hex(value: ScanValue) -> String {
+    let bytes = value.to_le_bytes();
+    let mut widened = [0u8; 8];
+    widened[..bytes.len()].copy_from_slice(&bytes);
+    format!("{:#X}", u64::from_le_bytes(widened))
 }
 
 fn format_value(value: ScanValue) -> String {
@@ -813,6 +828,7 @@ impl FerriteApp {
                                                     pointer_offsets: Vec::new(),
                                                     value: EntryValue::Scalar(m.value),
                                                     frozen: false,
+                                                    show_as_hex: false,
                                                 },
                                                 resolved_address: Some(m.address),
                                                 status: RowStatus::Resolved,
@@ -862,6 +878,7 @@ impl FerriteApp {
                                                     value: value_type
                                                         .entry_value_from_bytes(m.bytes.clone()),
                                                     frozen: false,
+                                                    show_as_hex: false,
                                                 },
                                                 resolved_address: Some(m.address),
                                                 status: RowStatus::Resolved,
@@ -954,6 +971,7 @@ impl FerriteApp {
             pointer_offsets,
             value,
             frozen: false,
+            show_as_hex: false,
         })
     }
 
@@ -1145,7 +1163,10 @@ impl FerriteApp {
                                     (_, status) => status.label(),
                                 };
                                 ui.label(address_text);
-                                ui.label(format_entry_value(&row.entry.value));
+                                ui.label(format_entry_value(
+                                    &row.entry.value,
+                                    row.entry.show_as_hex,
+                                ));
 
                                 match freeze_handle {
                                     Some(freeze) => show_saved_frozen_checkbox(ui, freeze, row),

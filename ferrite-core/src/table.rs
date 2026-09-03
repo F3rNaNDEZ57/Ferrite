@@ -87,6 +87,15 @@ pub struct CheatEntry {
     /// choice, see the vault's `v1-plan.md`).
     pub value: EntryValue,
     pub frozen: bool,
+    /// Show this entry's value as hexadecimal rather than decimal — Cheat
+    /// Engine's `<ShowAsHex>`, and what a `Pointer`-typed entry is for.
+    ///
+    /// Display only, and additive to the schema: `#[serde(default)]` means
+    /// tables saved by 0.2.0 still load unchanged. A saved entry's value is
+    /// rendered, never parsed back from the row, so this can't create an
+    /// ambiguity about which base typed input is in.
+    #[serde(default)]
+    pub show_as_hex: bool,
 }
 
 /// Why [`resolve_address`] failed to resolve an entry's live address.
@@ -267,6 +276,7 @@ mod tests {
                 pointer_offsets: Vec::new(),
                 value: EntryValue::Scalar(ScanValue::I32(100)),
                 frozen: false,
+                show_as_hex: false,
             },
             CheatEntry {
                 description: "module-relative two-level pointer".to_string(),
@@ -277,6 +287,7 @@ mod tests {
                 pointer_offsets: vec![0x8, 0x20],
                 value: EntryValue::Scalar(ScanValue::F32(1.5)),
                 frozen: true,
+                show_as_hex: false,
             },
             CheatEntry {
                 description: "byte pattern".to_string(),
@@ -284,6 +295,7 @@ mod tests {
                 pointer_offsets: Vec::new(),
                 value: EntryValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]),
                 frozen: false,
+                show_as_hex: false,
             },
             CheatEntry {
                 description: "unicode name".to_string(),
@@ -295,8 +307,32 @@ mod tests {
                     zero_terminated: true,
                 },
                 frozen: false,
+                show_as_hex: false,
             },
         ]
+    }
+
+    #[test]
+    fn a_table_saved_before_show_as_hex_existed_still_loads() {
+        // The field is additive: 0.2.0 wrote no `show_as_hex`, and those
+        // tables have to keep loading rather than repeating 0.2.0's own
+        // breaking change for a display flag.
+        let path = std::env::temp_dir().join(format!(
+            "ferrite-table-no-hex-field-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"[{"description":"HP","base":{"Absolute":4096},"pointer_offsets":[],
+                 "value":{"Scalar":{"I32":100}},"frozen":false}]"#,
+        )
+        .expect("writing a 0.2.0-shaped table");
+
+        let loaded = load_table(&path).expect("a 0.2.0 table should still load");
+        std::fs::remove_file(&path).expect("cleaning up the temp file");
+
+        assert_eq!(loaded.len(), 1);
+        assert!(!loaded[0].show_as_hex, "the flag should default to off");
     }
 
     #[test]

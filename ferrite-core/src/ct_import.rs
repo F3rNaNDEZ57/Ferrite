@@ -3,9 +3,9 @@
 //! (`MemoryRecordUnit.pas`/`CEFuncProc.pas` — see the vault's `v1-plan.md`
 //! for the full research), not guessed.
 //!
-//! Entries this can't represent (Lua scripts, structure dissect, codepage
-//! strings, over-deep pointer chains, unrecognized types, symbol/pointer-
-//! expression addresses)
+//! Entries this can't represent (Lua scripts, structure dissect, bit-field
+//! and custom types, codepage strings, over-deep pointer chains,
+//! unrecognized types, symbol/pointer-expression addresses)
 //! go into a visible [`ImportReport`] rather than being silently dropped or
 //! mis-imported, per the vault's `v1-scope.md`.
 
@@ -62,6 +62,10 @@ struct CheatEntryXml {
     // not a planned follow-on.
     #[serde(rename = "AssemblerScript", default)]
     assembler_script: Option<String>,
+    #[serde(rename = "ByteLength", default)]
+    byte_length: Option<String>,
+    #[serde(rename = "ShowAsHex", default)]
+    show_as_hex: Option<String>,
     #[serde(rename = "LastState", default)]
     last_state: Option<LastStateXml>,
     // A group entry has its own nested `<CheatEntries>` - structurally
@@ -251,13 +255,27 @@ fn import_leaf_entry(entry: &CheatEntryXml) -> Result<CheatEntry, String> {
         .variable_type
         .as_deref()
         .ok_or_else(|| "no VariableType".to_string())?;
-    // Strings are resolved here rather than in `map_variable_type`: their
-    // buffer size comes from `<Length>` and `<Unicode>`, which that function
-    // (which sees only the type string) has no way to reach.
-    let value = match variable_type {
-        "String" | "Unicode String" => import_string_value(entry, variable_type)?,
-        other => map_variable_type(other)?,
+    // Matched case-insensitively and trimmed, exactly as Cheat Engine's own
+    // `StringToVariableType` does (`s := trim(lowercase(s))`). Only the
+    // *matching* is normalized - messages keep the original text, so an
+    // unrecognized type is reported as it was actually written.
+    let type_key = variable_type.trim().to_ascii_lowercase();
+
+    // These two are resolved here rather than in `map_variable_type`: their
+    // size comes from a sibling element (`<Length>`/`<Unicode>`,
+    // `<ByteLength>`) that a function seeing only the type string can't
+    // reach.
+    let value = match type_key.as_str() {
+        "string" | "unicode string" => import_string_value(entry, variable_type)?,
+        "array of byte" => import_byte_array_value(entry)?,
+        _ => map_variable_type(&type_key, variable_type)?,
     };
+
+    // `<ShowAsHex>` is read before `<VariableType>` is applied in Cheat
+    // Engine's own loader, and `setVarType` then forces it on for a
+    // `Pointer` entry - so the type wins over the element, not the other
+    // way round.
+    let show_as_hex = type_key == "pointer" || element_flag(&entry.show_as_hex) == Some(true);
 
     let address_text = entry
         .address
@@ -302,15 +320,18 @@ fn import_leaf_entry(entry: &CheatEntryXml) -> Result<CheatEntry, String> {
         pointer_offsets,
         value,
         frozen: false, // see ImportReport::was_active_in_source
+        show_as_hex,
     })
 }
 
-/// The longest `<Length>` (in characters) this will import. Real string
-/// entries are names and labels - tens of characters, not thousands. A cap
-/// keeps a malformed or adversarial `.CT` from turning one declared length
-/// into a multi-gigabyte allocation and a read of the same size on every
-/// refresh tick; same reasoning as the pointer-chain depth cap.
-const MAX_STRING_LENGTH: usize = 4096;
+/// The longest buffer this will import from a declared length - `<Length>`
+/// in characters for a string, `<ByteLength>` in bytes for an array of
+/// byte. Real entries are names, labels and short signatures: tens of
+/// bytes, not thousands. A cap keeps a malformed or adversarial `.CT` from
+/// turning one declared length into a multi-gigabyte allocation and a read
+/// of the same size on every refresh tick; same reasoning as the
+/// pointer-chain depth cap.
+const MAX_BUFFER_LENGTH: usize = 4096;
 
 /// Builds a zero-filled string buffer of the width a `.CT` entry declares.
 ///
@@ -353,9 +374,9 @@ fn import_string_value(entry: &CheatEntryXml, variable_type: &str) -> Result<Ent
     if length == 0 {
         return Err(format!("{variable_type} entry declares <Length>0</Length>"));
     }
-    if length > MAX_STRING_LENGTH {
+    if length > MAX_BUFFER_LENGTH {
         return Err(format!(
-            "{variable_type} entry declares <Length>{length}</Length>, over the {MAX_STRING_LENGTH}-character limit"
+            "{variable_type} entry declares <Length>{length}</Length>, over the {MAX_BUFFER_LENGTH}-character limit"
         ));
     }
 
@@ -369,6 +390,32 @@ fn import_string_value(entry: &CheatEntryXml, variable_type: &str) -> Result<Ent
     })
 }
 
+/// Builds a zero-filled buffer of the width an `Array of byte` entry
+/// declares in `<ByteLength>` (decimal, like `<Length>`).
+///
+/// Imported as [`EntryValue::Bytes`] rather than a new variant: it *is* the
+/// AOB shape the scan side already produces, so it displays as a hex
+/// pattern that can be pasted straight back into the AOB search box.
+fn import_byte_array_value(entry: &CheatEntryXml) -> Result<EntryValue, String> {
+    let text = entry
+        .byte_length
+        .as_deref()
+        .ok_or_else(|| "Array of byte entry has no <ByteLength>".to_string())?;
+    let length: usize = text
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid <ByteLength> {text:?}"))?;
+    if length == 0 {
+        return Err("Array of byte entry declares <ByteLength>0</ByteLength>".to_string());
+    }
+    if length > MAX_BUFFER_LENGTH {
+        return Err(format!(
+            "Array of byte entry declares <ByteLength>{length}</ByteLength>, over the {MAX_BUFFER_LENGTH}-byte limit"
+        ));
+    }
+    Ok(EntryValue::Bytes(vec![0; length]))
+}
+
 /// Reads one of Cheat Engine's `"1"`/`"0"` flag elements: `None` when the
 /// element is absent (so the caller can apply CE's own default rather than
 /// a made-up one), and otherwise true only for exactly `"1"`, matching CE's
@@ -377,51 +424,51 @@ fn element_flag(value: &Option<String>) -> Option<bool> {
     value.as_deref().map(|v| v.trim() == "1")
 }
 
-/// Maps a `.CT` `<VariableType>` string to a zero-valued [`EntryValue`] of
-/// the matching shape (the real value is filled in on first live resolve,
-/// same as any other saved-list entry). Authoritative string table from
-/// Cheat Engine's own `VariableTypeToString`/`StringToVariableType`
-/// (`CEFuncProc.pas`) - see the vault's `v1-plan.md`. Unrecognized is
-/// always reported, never silently guessed - unlike Cheat Engine's own
-/// `StringToVariableType`, which falls back to `vtByte` for anything it
-/// doesn't recognize.
-fn map_variable_type(s: &str) -> Result<EntryValue, String> {
-    match s {
-        "Byte" => Ok(EntryValue::Scalar(ScanValue::I8(0))),
-        "2 Bytes" => Ok(EntryValue::Scalar(ScanValue::I16(0))),
-        "4 Bytes" => Ok(EntryValue::Scalar(ScanValue::I32(0))),
-        "8 Bytes" => Ok(EntryValue::Scalar(ScanValue::I64(0))),
-        "Float" => Ok(EntryValue::Scalar(ScanValue::F32(0.0))),
-        "Double" => Ok(EntryValue::Scalar(ScanValue::F64(0.0))),
+/// Maps a `.CT` `<VariableType>` to a zero-valued [`EntryValue`] of the
+/// matching shape (the real value is filled in on first live resolve, same
+/// as any other saved-list entry). `key` is the trimmed, lowercased type
+/// string; `original` is what the file actually said, used only in
+/// messages so a report names the text a user would find if they searched
+/// for it.
+///
+/// Authoritative string table from Cheat Engine's own
+/// `VariableTypeToString`/`StringToVariableType` (`CEFuncProc.pas`) - see
+/// the vault's `v1-plan.md`. Unrecognized is always reported, never
+/// silently guessed - unlike `StringToVariableType`, which falls back to
+/// `vtByte` for anything it doesn't recognize.
+fn map_variable_type(key: &str, original: &str) -> Result<EntryValue, String> {
+    match key {
+        "byte" => Ok(EntryValue::Scalar(ScanValue::I8(0))),
+        "2 bytes" => Ok(EntryValue::Scalar(ScanValue::I16(0))),
+        "4 bytes" => Ok(EntryValue::Scalar(ScanValue::I32(0))),
+        "8 bytes" => Ok(EntryValue::Scalar(ScanValue::I64(0))),
+        "float" => Ok(EntryValue::Scalar(ScanValue::F32(0.0))),
+        "double" => Ok(EntryValue::Scalar(ScanValue::F64(0.0))),
+        // A pointer is an address-sized integer shown in hex - that's all
+        // `vtPointer` is once Cheat Engine's own `setVarType` is done with
+        // it (it rewrites the type to vtQword/vtDword and turns ShowAsHex
+        // on). Ferrite is 64-bit only, so it's always the 8-byte form.
+        "pointer" => Ok(EntryValue::Scalar(ScanValue::I64(0))),
         // Intercepted by `import_leaf_entry` before this is reached, since a
         // string's shape depends on sibling elements, not just its type
         // name. Kept as an explicit arm rather than left to fall into
         // `other` so that removing that interception surfaces as a
         // conspicuous internal error instead of reporting a real Cheat
         // Engine type as "unrecognized".
-        "String" | "Unicode String" => Err(format!(
-            "internal: {s} entries are handled by import_leaf_entry, not map_variable_type"
+        "string" | "unicode string" | "array of byte" => Err(format!(
+            "internal: {original} entries are handled by import_leaf_entry, not map_variable_type"
         )),
-        // Unlike the fixed-width numeric types above, these two are only
-        // confirmed *names* from Cheat Engine's source - never seen in a
-        // real table, so their exact on-disk structure (does "Array of
-        // byte" carry a length field? what does "Pointer" need beyond an
-        // address?) isn't verified. Reported rather than guessed.
-        "Array of byte" => Err(
-            "Array of byte entries aren't supported yet (byte-length encoding not verified against a real table)"
-                .to_string(),
-        ),
-        "Pointer" => Err(
-            "Pointer-typed entries aren't supported yet (structure not verified against a real table)"
-                .to_string(),
-        ),
-        "Auto Assembler Script" => {
+        "auto assembler script" => {
             Err("Auto Assembler Script (Lua) entries aren't supported".to_string())
         }
-        "Custom" => Err("Custom-type entries aren't supported (require Lua conversion functions)".to_string()),
-        "Binary" => Err("Binary (bit-field) entries aren't supported".to_string()),
-        "All" | "Grouped" => Err(format!("unexpected VariableType {s:?} on a leaf entry")),
-        other => Err(format!("unrecognized VariableType {other:?}")),
+        "custom" => Err(
+            "Custom-type entries aren't supported (require Lua conversion functions)".to_string(),
+        ),
+        "binary" => Err("Binary (bit-field) entries aren't supported".to_string()),
+        "all" | "grouped" => Err(format!(
+            "unexpected VariableType {original:?} on a leaf entry"
+        )),
+        _ => Err(format!("unrecognized VariableType {original:?}")),
     }
 }
 
@@ -577,16 +624,73 @@ mod tests {
     }
 
     #[test]
+    fn an_array_of_byte_without_a_bytelength_is_reported() {
+        let report = import_ct_xml(&one_entry_table(
+            "<VariableType>Array of byte</VariableType>",
+        ))
+        .expect("parsing");
+        assert_eq!(report.imported.len(), 0);
+        assert!(
+            report.skipped[0].reason.contains("<ByteLength>"),
+            "got: {}",
+            report.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn an_absurd_bytelength_is_capped_rather_than_allocated() {
+        let report = import_ct_xml(&one_entry_table(
+            "<VariableType>Array of byte</VariableType><ByteLength>999999999</ByteLength>",
+        ))
+        .expect("parsing");
+        assert_eq!(report.imported.len(), 0);
+        assert!(
+            report.skipped[0].reason.contains("limit"),
+            "got: {}",
+            report.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_type_is_reported_with_the_text_the_file_used() {
+        // Matching is case-insensitive, but the *message* has to quote the
+        // original so a user can search their table for it.
+        let report = import_ct_xml(&one_entry_table(
+            "<VariableType>Something CE Added Later</VariableType>",
+        ))
+        .expect("parsing");
+        assert!(
+            report.skipped[0]
+                .reason
+                .contains("Something CE Added Later"),
+            "got: {}",
+            report.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn a_pointer_entry_stays_hex_even_with_showashex_switched_off() {
+        // CE reads <ShowAsHex> *before* it applies <VariableType>, and
+        // setVarType then forces hex on for a pointer - so the type wins.
+        let report = import_ct_xml(&one_entry_table(
+            "<VariableType>Pointer</VariableType><ShowAsHex>0</ShowAsHex>",
+        ))
+        .expect("parsing");
+        assert!(report.imported[0].show_as_hex);
+    }
+
+    #[test]
     fn basic_table_imports_supported_entries_and_reports_the_rest() {
         let report =
             import_ct_xml(&load_fixture("basic_table.CT")).expect("parsing basic_table.CT");
 
         // Imported: the two grouped entries, the absolute byte, the
         // single-level pointer, the was-activated entry, the four string
-        // entries, and the three-level pointer chain = 10.
+        // entries, the three-level pointer chain, the array of byte, the
+        // Pointer, the ShowAsHex entry, and the lowercase-typed one = 14.
         assert_eq!(
             report.imported.len(),
-            10,
+            14,
             "unexpected imported set: {:#?}",
             report.imported
         );
@@ -649,6 +753,47 @@ mod tests {
             .find(|e| e.description == "Multi-level pointer chain")
             .expect("a 3-offset entry should import now, not be skipped");
         assert_eq!(multi_level.pointer_offsets, vec![0x10, 0x20, 0x30]);
+
+        let entry = |description: &str| {
+            report
+                .imported
+                .iter()
+                .find(|e| e.description == description)
+                .unwrap_or_else(|| panic!("{description:?} should import"))
+        };
+
+        // `<ByteLength>` is a byte count, decimal - the AOB shape the scan
+        // side already produces, so it displays as a pasteable hex pattern.
+        assert_eq!(
+            entry("Signature (array of byte)").value,
+            EntryValue::Bytes(vec![0; 6])
+        );
+
+        // A Pointer is an address-sized integer shown in hex: that's all
+        // CE's own setVarType leaves it as. The hex flag comes from the
+        // *type*, with no <ShowAsHex> element present at all.
+        let pointer = entry("Player base (pointer)");
+        assert_eq!(pointer.value, EntryValue::Scalar(ScanValue::I64(0)));
+        assert!(
+            pointer.show_as_hex,
+            "a Pointer entry is hex-displayed by its type, not by an element"
+        );
+
+        // ...and <ShowAsHex> works on an ordinary numeric entry too.
+        let flags = entry("Flags (shown as hex)");
+        assert_eq!(flags.value, EntryValue::Scalar(ScanValue::I32(0)));
+        assert!(flags.show_as_hex);
+        assert!(
+            !entry("Byte at an absolute address").show_as_hex,
+            "absent <ShowAsHex> means off"
+        );
+
+        // Type names match case-insensitively, as CE's own
+        // StringToVariableType does (`s := trim(lowercase(s))`).
+        assert_eq!(
+            entry("Lowercase type name").value,
+            EntryValue::Scalar(ScanValue::I32(0))
+        );
 
         let was_frozen = report
             .imported

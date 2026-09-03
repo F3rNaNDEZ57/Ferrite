@@ -69,6 +69,7 @@ fn cheat_entry_with_pointer_offset_resolves_to_hp() {
         pointer_offsets: vec![0],
         value: EntryValue::Scalar(ScanValue::I32(100)),
         frozen: false,
+        show_as_hex: false,
     };
 
     let resolved = resolve_address(&entry, &session).expect("resolving the entry");
@@ -88,6 +89,7 @@ fn cheat_entry_with_a_two_level_chain_resolves_through_ptr2_to_hp() {
         pointer_offsets: vec![0, 0],
         value: EntryValue::Scalar(ScanValue::I32(100)),
         frozen: false,
+        show_as_hex: false,
     };
 
     let resolved = resolve_address(&entry, &session).expect("resolving the two-level entry");
@@ -119,6 +121,7 @@ fn an_entry_with_no_offsets_resolves_to_its_base_address_untouched() {
         pointer_offsets: Vec::new(),
         value: EntryValue::Scalar(ScanValue::I32(100)),
         frozen: false,
+        show_as_hex: false,
     };
 
     assert_eq!(
@@ -141,6 +144,7 @@ fn cheat_entry_with_missing_module_reports_which_one() {
         pointer_offsets: Vec::new(),
         value: EntryValue::Scalar(ScanValue::I32(0)),
         frozen: false,
+        show_as_hex: false,
     };
 
     match resolve_address(&entry, &session) {
