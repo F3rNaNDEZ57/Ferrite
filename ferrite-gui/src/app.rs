@@ -1075,7 +1075,31 @@ impl FerriteApp {
                     .show(ui, |ui| {
                         for skipped in &report.skipped {
                             ui.label(&skipped.description);
-                            ui.colored_label(theme::ERROR, &skipped.reason);
+                            // A script can run to dozens of lines, so it
+                            // gets a collapsed section of its own rather
+                            // than being crammed into this two-column row.
+                            // Collapsed by default: it's there to be read
+                            // on purpose, not to bury the reasons for every
+                            // other skipped entry under a wall of text.
+                            ui.vertical(|ui| {
+                                ui.colored_label(theme::ERROR, &skipped.reason);
+                                if let Some(script) = &skipped.script_text {
+                                    egui::CollapsingHeader::new("Show script")
+                                        .id_salt(("import_script", &skipped.description))
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                "Ferrite never runs these - shown so you can \
+                                                 read what the table would have done.",
+                                            );
+                                            ui.add(
+                                                egui::TextEdit::multiline(&mut script.as_str())
+                                                    .code_editor()
+                                                    .desired_width(f32::INFINITY),
+                                            );
+                                        });
+                                }
+                            });
                             ui.end_row();
                         }
                     });

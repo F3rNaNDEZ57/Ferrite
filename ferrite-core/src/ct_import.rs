@@ -54,6 +54,14 @@ struct CheatEntryXml {
     zero_terminate: Option<String>,
     #[serde(rename = "CodePage", default)]
     code_page: Option<String>,
+    // Parsed but never executed. Ferrite only ever touches data, never
+    // code; this exists so a skipped script entry can be *read* by the
+    // person deciding whether they trust it, which is exactly the decision
+    // a downloaded table with an embedded script asks them to make. See the
+    // vault's `v0.2-scope.md` for why executing these is out of scope and
+    // not a planned follow-on.
+    #[serde(rename = "AssemblerScript", default)]
+    assembler_script: Option<String>,
     #[serde(rename = "LastState", default)]
     last_state: Option<LastStateXml>,
     // A group entry has its own nested `<CheatEntries>` - structurally
@@ -87,6 +95,11 @@ struct LastStateXml {
 pub struct SkippedEntry {
     pub description: String,
     pub reason: String,
+    /// The entry's raw `<AssemblerScript>` text, for `Auto Assembler
+    /// Script` entries only. Display-only: it exists so a user can read
+    /// what a table's script *would* have done and judge it by hand.
+    /// Nothing here executes it, and this is not a step toward that.
+    pub script_text: Option<String>,
 }
 
 /// The result of importing a `.CT` file.
@@ -187,9 +200,28 @@ fn import_entries(entries: &[CheatEntryXml], group_path: &str, report: &mut Impo
             Err(reason) => report.skipped.push(SkippedEntry {
                 description: full_description,
                 reason,
+                script_text: script_text_of(entry),
             }),
         }
     }
+}
+
+/// The raw script text of an `Auto Assembler Script` entry, if it has any.
+///
+/// Restricted to that one type on purpose rather than surfacing whatever
+/// `<AssemblerScript>` happens to be present: it's the type whose *whole
+/// content* is the script, so it's the only one where showing the text
+/// explains the skip rather than adding noise to it.
+fn script_text_of(entry: &CheatEntryXml) -> Option<String> {
+    if entry.variable_type.as_deref() != Some("Auto Assembler Script") {
+        return None;
+    }
+    entry
+        .assembler_script
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 /// A group (folder/category) entry, not a leaf - presence of its own
@@ -432,6 +464,22 @@ mod tests {
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].description, "Enable +info");
         assert!(report.skipped[0].reason.contains("Auto Assembler Script"));
+
+        // The script text comes along so a user can read what the entry
+        // would have done - display only, never executed.
+        let script = report.skipped[0]
+            .script_text
+            .as_deref()
+            .expect("an Auto Assembler Script skip should carry its script text");
+        assert!(script.starts_with("{$LUA}"), "got: {script}");
+        assert!(script.contains("print(\"hello\")"), "got: {script}");
+
+        // ...and only that type carries one: a String skip is not a script.
+        let no_script = import_ct_xml(&one_entry_table(
+            "<VariableType>String</VariableType><CodePage>1</CodePage><Length>4</Length>",
+        ))
+        .expect("parsing");
+        assert_eq!(no_script.skipped[0].script_text, None);
     }
 
     /// Wraps one leaf `<CheatEntry>` body in the minimum table around it,
