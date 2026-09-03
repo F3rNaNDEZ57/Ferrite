@@ -4,7 +4,8 @@
 //! for the full research), not guessed.
 //!
 //! Entries this can't represent (Lua scripts, structure dissect, multi-level
-//! pointer chains, unrecognized types, symbol/pointer-expression addresses)
+//! pointer chains, codepage strings, unrecognized types, symbol/pointer-
+//! expression addresses)
 //! go into a visible [`ImportReport`] rather than being silently dropped or
 //! mis-imported, per the vault's `v1-scope.md`.
 
@@ -14,6 +15,7 @@ use serde::Deserialize;
 
 use crate::scan_value::ScanValue;
 use crate::table::{CheatEntry, EntryValue, parse_address_expr, parse_hex_usize};
+use crate::text::TextEncoding;
 
 #[derive(Debug, Deserialize)]
 struct CheatTableXml {
@@ -37,6 +39,20 @@ struct CheatEntryXml {
     address: Option<String>,
     #[serde(rename = "Offsets", default)]
     offsets: Option<OffsetsXml>,
+    // The four `vtString` child elements Cheat Engine reads and writes
+    // (`MemoryRecordUnit.pas`). Child *elements* with "1"/"0" text content,
+    // not attributes - checked against CE's own read and write paths rather
+    // than assumed, since the `@Activated` shape next door proves that
+    // guessing this wrong fails silently as a `None` that looks like a
+    // legitimate default.
+    #[serde(rename = "Length", default)]
+    length: Option<String>,
+    #[serde(rename = "Unicode", default)]
+    unicode: Option<String>,
+    #[serde(rename = "ZeroTerminate", default)]
+    zero_terminate: Option<String>,
+    #[serde(rename = "CodePage", default)]
+    code_page: Option<String>,
     #[serde(rename = "LastState", default)]
     last_state: Option<LastStateXml>,
     // A group entry has its own nested `<CheatEntries>` - structurally
@@ -202,7 +218,13 @@ fn import_leaf_entry(entry: &CheatEntryXml) -> Result<CheatEntry, String> {
         .variable_type
         .as_deref()
         .ok_or_else(|| "no VariableType".to_string())?;
-    let value = map_variable_type(variable_type)?;
+    // Strings are resolved here rather than in `map_variable_type`: their
+    // buffer size comes from `<Length>` and `<Unicode>`, which that function
+    // (which sees only the type string) has no way to reach.
+    let value = match variable_type {
+        "String" | "Unicode String" => import_string_value(entry, variable_type)?,
+        other => map_variable_type(other)?,
+    };
 
     let address_text = entry
         .address
@@ -249,6 +271,78 @@ fn import_leaf_entry(entry: &CheatEntryXml) -> Result<CheatEntry, String> {
     })
 }
 
+/// The longest `<Length>` (in characters) this will import. Real string
+/// entries are names and labels - tens of characters, not thousands. A cap
+/// keeps a malformed or adversarial `.CT` from turning one declared length
+/// into a multi-gigabyte allocation and a read of the same size on every
+/// refresh tick; same reasoning as the pointer-chain depth cap.
+const MAX_STRING_LENGTH: usize = 4096;
+
+/// Builds a zero-filled string buffer of the width a `.CT` entry declares.
+///
+/// Defaults here are Cheat Engine's own, taken from `setVarType`
+/// (`MemoryRecordUnit.pas`) rather than from what looks natural: setting
+/// either string type turns `ZeroTerminate` **on**, and `Unicode String`
+/// additionally turns `unicode` on before folding itself into a plain
+/// `vtString`. The XML read path then overrides each only when the element
+/// is actually present - so an absent `<ZeroTerminate>` means *true*, not
+/// false, and an explicit `<Unicode>0</Unicode>` demotes even a
+/// `Unicode String` entry.
+fn import_string_value(entry: &CheatEntryXml, variable_type: &str) -> Result<EntryValue, String> {
+    // `<CodePage>1</CodePage>` is a third encoding (Windows codepage text,
+    // which CE round-trips through `UTF8ToWinCP`), not a flavor of Latin-1.
+    // Reported rather than decoded as something it isn't.
+    if element_flag(&entry.code_page) == Some(true) {
+        return Err(
+            "String entries with <CodePage>1</CodePage> aren't supported (only Latin-1 and UTF-16)"
+                .to_string(),
+        );
+    }
+
+    let encoding = match element_flag(&entry.unicode) {
+        Some(true) => TextEncoding::Utf16Le,
+        Some(false) => TextEncoding::Latin1,
+        None if variable_type == "Unicode String" => TextEncoding::Utf16Le,
+        None => TextEncoding::Latin1,
+    };
+    let zero_terminated = element_flag(&entry.zero_terminate).unwrap_or(true);
+
+    // Decimal, not hex, unlike `<Offset>` - CE parses it with `strtoint`.
+    let length_text = entry
+        .length
+        .as_deref()
+        .ok_or_else(|| format!("{variable_type} entry has no <Length>"))?;
+    let length: usize = length_text
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid <Length> {length_text:?}"))?;
+    if length == 0 {
+        return Err(format!("{variable_type} entry declares <Length>0</Length>"));
+    }
+    if length > MAX_STRING_LENGTH {
+        return Err(format!(
+            "{variable_type} entry declares <Length>{length}</Length>, over the {MAX_STRING_LENGTH}-character limit"
+        ));
+    }
+
+    // `<Length>` counts characters; the buffer is twice that in bytes for
+    // UTF-16 (CE's own `getByteSize`). Zero-filled, like every other
+    // imported value - the real contents arrive on the first live resolve.
+    Ok(EntryValue::Text {
+        bytes: vec![0; length * encoding.bytes_per_char()],
+        encoding,
+        zero_terminated,
+    })
+}
+
+/// Reads one of Cheat Engine's `"1"`/`"0"` flag elements: `None` when the
+/// element is absent (so the caller can apply CE's own default rather than
+/// a made-up one), and otherwise true only for exactly `"1"`, matching CE's
+/// `tempnode.TextContent='1'` comparison.
+fn element_flag(value: &Option<String>) -> Option<bool> {
+    value.as_deref().map(|v| v.trim() == "1")
+}
+
 /// Maps a `.CT` `<VariableType>` string to a zero-valued [`EntryValue`] of
 /// the matching shape (the real value is filled in on first live resolve,
 /// same as any other saved-list entry). Authoritative string table from
@@ -265,9 +359,15 @@ fn map_variable_type(s: &str) -> Result<EntryValue, String> {
         "8 Bytes" => Ok(EntryValue::Scalar(ScanValue::I64(0))),
         "Float" => Ok(EntryValue::Scalar(ScanValue::F32(0.0))),
         "Double" => Ok(EntryValue::Scalar(ScanValue::F64(0.0))),
-        "String" | "Unicode String" => {
-            Err(format!("{s} entries aren't supported yet (deferred to v1.1)"))
-        }
+        // Intercepted by `import_leaf_entry` before this is reached, since a
+        // string's shape depends on sibling elements, not just its type
+        // name. Kept as an explicit arm rather than left to fall into
+        // `other` so that removing that interception surfaces as a
+        // conspicuous internal error instead of reporting a real Cheat
+        // Engine type as "unrecognized".
+        "String" | "Unicode String" => Err(format!(
+            "internal: {s} entries are handled by import_leaf_entry, not map_variable_type"
+        )),
         // Unlike the fixed-width numeric types above, these two are only
         // confirmed *names* from Cheat Engine's source - never seen in a
         // real table, so their exact on-disk structure (does "Array of
@@ -332,24 +432,90 @@ mod tests {
         assert!(report.skipped[0].reason.contains("Auto Assembler Script"));
     }
 
+    /// Wraps one leaf `<CheatEntry>` body in the minimum table around it,
+    /// for the string cases that don't warrant their own fixture file.
+    fn one_entry_table(body: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>
+             <CheatTable><CheatEntries><CheatEntry>
+             <Description>\"S\"</Description><Address>\"game.exe\"+1000</Address>
+             {body}
+             </CheatEntry></CheatEntries></CheatTable>"
+        )
+    }
+
+    #[test]
+    fn a_codepage_string_is_reported_rather_than_decoded_as_latin1() {
+        let report = import_ct_xml(&one_entry_table(
+            "<VariableType>String</VariableType><Length>10</Length><CodePage>1</CodePage>",
+        ))
+        .expect("parsing");
+        assert_eq!(report.imported.len(), 0);
+        assert!(
+            report.skipped[0].reason.contains("CodePage"),
+            "got: {}",
+            report.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn a_string_without_a_length_is_reported_rather_than_imported_empty() {
+        let report = import_ct_xml(&one_entry_table("<VariableType>String</VariableType>"))
+            .expect("parsing");
+        assert_eq!(report.imported.len(), 0);
+        assert!(
+            report.skipped[0].reason.contains("<Length>"),
+            "got: {}",
+            report.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn an_absurd_length_is_capped_rather_than_allocated() {
+        // A malformed or adversarial table must not turn one declared
+        // length into a multi-gigabyte buffer that every refresh tick then
+        // re-reads.
+        let report = import_ct_xml(&one_entry_table(
+            "<VariableType>String</VariableType><Length>999999999</Length>",
+        ))
+        .expect("parsing");
+        assert_eq!(report.imported.len(), 0);
+        assert!(
+            report.skipped[0].reason.contains("limit"),
+            "got: {}",
+            report.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn a_length_is_parsed_as_decimal_not_hex() {
+        // Unlike <Offset>, which is hex. CE reads <Length> with strtoint,
+        // so <Length>20</Length> is twenty characters, not thirty-two.
+        let report = import_ct_xml(&one_entry_table(
+            "<VariableType>String</VariableType><Length>20</Length>",
+        ))
+        .expect("parsing");
+        assert_eq!(report.imported[0].value.to_le_bytes().len(), 20);
+    }
+
     #[test]
     fn basic_table_imports_supported_entries_and_reports_the_rest() {
         let report =
             import_ct_xml(&load_fixture("basic_table.CT")).expect("parsing basic_table.CT");
 
         // Imported: the two grouped entries, the absolute byte, the
-        // single-level pointer, and the was-activated entry = 5.
+        // single-level pointer, the was-activated entry, and the four
+        // string entries = 9.
         assert_eq!(
             report.imported.len(),
-            5,
+            9,
             "unexpected imported set: {:#?}",
             report.imported
         );
-        // Skipped: multi-level chain, four String entries, bracket
-        // address, unknown type = 7.
+        // Skipped: multi-level chain, bracket address, unknown type = 3.
         assert_eq!(
             report.skipped.len(),
-            7,
+            3,
             "unexpected skipped set: {:#?}",
             report.skipped
         );
@@ -426,28 +592,65 @@ mod tests {
             .expect("a bracket address should be reported, not mis-imported");
         assert!(bracket.reason.contains("symbol/pointer-expression"));
 
-        // All four string shapes the fixture covers - plain `String`
-        // with only a `<Length>`, `<Unicode>1</Unicode>`,
-        // `<ZeroTerminate>1</ZeroTerminate>`, and the distinct
-        // `Unicode String` VariableType. Asserted together here so the
-        // commit that makes strings importable has to move all four at
-        // once, rather than flipping one and leaving an untested
-        // attribute combination behind (the absent-attribute-default
-        // trap `@Activated` already caught once).
-        for description in [
-            "Player name",
-            "Player name (unicode)",
-            "Zone name (zero-terminated)",
-            "Clan tag (Unicode String type)",
-        ] {
-            assert!(
-                report
-                    .skipped
-                    .iter()
-                    .any(|s| s.description == description && s.reason.contains("String")),
-                "expected {description:?} to be skip-reported as a string entry"
-            );
-        }
+        // All four string shapes the fixture covers, each asserted for the
+        // buffer width and flags it should end up with - not just for
+        // having been imported. Widths are the decisive part: <Length> is a
+        // character count, so a unicode entry's buffer is twice its
+        // declared length, and getting that backwards would silently import
+        // half a string and write that truncated buffer back on every
+        // freeze tick.
+        let string_entry = |description: &str| {
+            report
+                .imported
+                .iter()
+                .find(|e| e.description == description)
+                .unwrap_or_else(|| panic!("{description:?} should import"))
+                .value
+                .clone()
+        };
+
+        // <Length>20</Length>, no <Unicode>, no <ZeroTerminate>: Latin-1,
+        // 20 bytes, and zero-terminated by CE's own setVarType default -
+        // the absent-element case, where a made-up `false` default would
+        // have been wrong.
+        assert_eq!(
+            string_entry("Player name"),
+            EntryValue::Text {
+                bytes: vec![0; 20],
+                encoding: TextEncoding::Latin1,
+                zero_terminated: true,
+            }
+        );
+        // <Length>16</Length> + <Unicode>1</Unicode>: 32 bytes, and an
+        // explicit <ZeroTerminate>0</ZeroTerminate> overriding the default.
+        assert_eq!(
+            string_entry("Player name (unicode)"),
+            EntryValue::Text {
+                bytes: vec![0; 32],
+                encoding: TextEncoding::Utf16Le,
+                zero_terminated: false,
+            }
+        );
+        assert_eq!(
+            string_entry("Zone name (zero-terminated)"),
+            EntryValue::Text {
+                bytes: vec![0; 12],
+                encoding: TextEncoding::Latin1,
+                zero_terminated: true,
+            }
+        );
+        // The distinct "Unicode String" VariableType, with neither element
+        // present: CE's setVarType turns on both unicode and ZeroTerminate
+        // before folding it into a plain vtString.
+        assert_eq!(
+            string_entry("Clan tag (Unicode String type)"),
+            EntryValue::Text {
+                bytes: vec![0; 16],
+                encoding: TextEncoding::Utf16Le,
+                zero_terminated: true,
+            }
+        );
+
         assert!(
             report.skipped.iter().any(
                 |s| s.description == "Unknown future type" && s.reason.contains("unrecognized")
