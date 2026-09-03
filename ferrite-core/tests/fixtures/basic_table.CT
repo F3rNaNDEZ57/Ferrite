@@ -69,6 +69,34 @@
       <Address>"game.exe"+6000</Address>
     </CheatEntry>
     <CheatEntry>
+      <ID>11</ID>
+      <Description>"Player name (unicode)"</Description>
+      <LastState/>
+      <VariableType>String</VariableType>
+      <Length>16</Length>
+      <Unicode>1</Unicode>
+      <ZeroTerminate>0</ZeroTerminate>
+      <Address>"game.exe"+6100</Address>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>12</ID>
+      <Description>"Zone name (zero-terminated)"</Description>
+      <LastState/>
+      <VariableType>String</VariableType>
+      <Length>12</Length>
+      <Unicode>0</Unicode>
+      <ZeroTerminate>1</ZeroTerminate>
+      <Address>"game.exe"+6200</Address>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>13</ID>
+      <Description>"Clan tag (Unicode String type)"</Description>
+      <LastState/>
+      <VariableType>Unicode String</VariableType>
+      <Length>8</Length>
+      <Address>"game.exe"+6300</Address>
+    </CheatEntry>
+    <CheatEntry>
       <ID>9</ID>
       <Description>"Injected pointer expression"</Description>
       <LastState/>

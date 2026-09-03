@@ -345,11 +345,11 @@ mod tests {
             "unexpected imported set: {:#?}",
             report.imported
         );
-        // Skipped: multi-level chain, String, bracket address, unknown
-        // type = 4.
+        // Skipped: multi-level chain, four String entries, bracket
+        // address, unknown type = 7.
         assert_eq!(
             report.skipped.len(),
-            4,
+            7,
             "unexpected skipped set: {:#?}",
             report.skipped
         );
@@ -426,12 +426,28 @@ mod tests {
             .expect("a bracket address should be reported, not mis-imported");
         assert!(bracket.reason.contains("symbol/pointer-expression"));
 
-        assert!(
-            report
-                .skipped
-                .iter()
-                .any(|s| s.description == "Player name" && s.reason.contains("String"))
-        );
+        // All four string shapes the fixture covers - plain `String`
+        // with only a `<Length>`, `<Unicode>1</Unicode>`,
+        // `<ZeroTerminate>1</ZeroTerminate>`, and the distinct
+        // `Unicode String` VariableType. Asserted together here so the
+        // commit that makes strings importable has to move all four at
+        // once, rather than flipping one and leaving an untested
+        // attribute combination behind (the absent-attribute-default
+        // trap `@Activated` already caught once).
+        for description in [
+            "Player name",
+            "Player name (unicode)",
+            "Zone name (zero-terminated)",
+            "Clan tag (Unicode String type)",
+        ] {
+            assert!(
+                report
+                    .skipped
+                    .iter()
+                    .any(|s| s.description == description && s.reason.contains("String")),
+                "expected {description:?} to be skip-reported as a string entry"
+            );
+        }
         assert!(
             report.skipped.iter().any(
                 |s| s.description == "Unknown future type" && s.reason.contains("unrecognized")
