@@ -2324,11 +2324,13 @@ impl FerriteApp {
         };
 
         let lines = script.lines().count();
+        // The controls sit on their own line, above the description rather
+        // than beside it. A real table's descriptions run to sixty
+        // characters or more, and sharing one line meant either the buttons
+        // were pushed out of the pane or the description truncated to "M…" —
+        // both worse than spending a second line. Fixtures never showed
+        // this, because their descriptions are short.
         ui.horizontal(|ui| {
-            ui.add(
-                egui::Label::new(egui::RichText::new(&entry.description).color(theme::TEXT))
-                    .truncate(),
-            );
             ui.label(
                 egui::RichText::new(format!("{lines} lines"))
                     .font(theme::font(theme::text_style::SECONDARY))
@@ -2341,6 +2343,7 @@ impl FerriteApp {
                 }
             });
         });
+        ui.add(egui::Label::new(egui::RichText::new(&entry.description).color(theme::TEXT)).wrap());
         // The copy narrows rather than disappearing: for an Auto Assembler
         // entry it is still exactly true, and that is most of them.
         let runnable = entry.script_kind.is_some_and(|kind| kind.is_runnable());
