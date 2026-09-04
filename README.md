@@ -12,19 +12,25 @@ by construction, and maintained in the open.
 
 ## Status
 
-**v0.3.0 is out.** The full core loop works and is verified against a real
+**v1.0.0 is out.** The full core loop works and is verified against a real
 target process: **attach → scan → filter (next scan) → edit / freeze →
 save & load a cheat table** (our own JSON format, plus importing existing
 Cheat Engine `.CT` tables).
 
-- Process attach/detach, with elevation errors surfaced as readable text.
+- One window, three regions: a rail holding every scan control, a results
+  table that takes all the remaining width, and a docked saved list that
+  can't be pushed off-screen.
+- Process attach/detach with a filterable process list that shows which
+  targets are 32-bit (Ferrite attaches to 64-bit only) and elevation errors
+  surfaced as readable text.
 - Exact-value scanning (`i8`–`i64`, `f32`/`f64`), byte-pattern (AOB)
   scanning, and string scanning (`String` / `Unicode String`, i.e.
   Latin-1 and UTF-16LE) — all with next-scan filters
   (changed/unchanged/increased/decreased).
-- Live-refreshing results table, writing a new value to selected results,
-  and freeze/unfreeze (a background thread pins a value against whatever
-  the target does to it).
+- A virtualised, live-refreshing results table — address, current value,
+  previous value and `module+offset` — writing a new value to selected
+  results, and freeze/unfreeze (a background thread pins a value against
+  whatever the target does to it).
 - A saved list separate from scan results: promote a result, or add an
   address manually (module-relative or absolute, with an optional
   multi-level pointer chain).

@@ -10,6 +10,73 @@ Pre-1.0, a minor version bump may carry a breaking change — see `0.2.0`.
 
 Nothing yet.
 
+## [1.0.0] — 2026-09-04
+
+[Release](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.0.0)
+
+The interface, rebuilt. Cheat tables saved by `0.3.0` load unchanged —
+this release changes how Ferrite looks and how its window is arranged,
+not what it stores.
+
+### Changed — the whole interface
+
+- **Three docked regions replace five stacked cards.** A top bar, a left
+  rail holding every scan control, a central results region, and a
+  saved-list dock. Each region has its own scroll, so the saved list can no
+  longer be pushed off the bottom of the window by anything above it.
+- **The results table is virtualised** at a fixed 24 px row, with exact
+  column widths. A scan can return tens of thousands of addresses and every
+  visible row re-reads target memory ten times a second, so only the rows
+  actually on screen are built at all.
+- **Addresses line up.** They are printed as a fixed-width 16 digits with
+  the leading zeros dimmed, instead of `0x14a20` sitting next to
+  `0x7ff6a41c58da` and reading as ragged text rather than a column.
+- **Every fallible field owns a fixed message slot**, so an error can never
+  move the layout, and the scan field validates as you type — First Scan
+  stays disabled until the value parses, which makes an invalid scan
+  impossible rather than merely reported.
+- **A new palette and type scale.** A warm near-black ground and a single
+  oxide-red accent that means exactly one thing: attention. A red fill is an
+  action you may take; red type or a red rule is a problem you must read.
+  Zero corner radius everywhere, no shadows, and Archivo + JetBrains Mono
+  embedded in the binary (both OFL) so it renders the same on any machine.
+- **Columns drop rather than squeeze** as the window narrows, and the layout
+  holds down to 1024 × 700. The rail never collapses — it holds the primary
+  action.
+
+### Added
+
+- **A process filter and an architecture column.** The picker filters over
+  name, PID and path, and shows which targets are 32-bit — those say
+  "64-bit only" instead of offering an Attach that would fail later. Hiding
+  them is on by default.
+- **A `PREVIOUS` column** showing what each address held before the last
+  rescan, so a filtered set shows what it was filtered against.
+- **A `MODULE + OFFSET` column**, resolving each address back to
+  `game.exe+1C58DA0` where it falls inside a loaded module.
+- **The import report is a split view**: skipped entries on the left, the
+  selected entry's script in full on the right, with Copy and a wrap toggle.
+  It exists so a downloaded table's script can be *read* before it is
+  trusted. Ferrite still never assembles, injects or runs any of it.
+- **Manual add is a validating modal** that shows the pointer expression it
+  is building — `[[7FF698F52228]+0]+0` — before anything is added, and keeps
+  Add disabled until the whole form parses.
+- **A live value flashes** when it changes on the refresh tick and decays
+  back over 400 ms, so a change is visible even if you were looking
+  elsewhere.
+- Scan history, as the chain of match counts: `18402 → 412 → 6`.
+
+### Notes
+
+- `ferrite-core` gained `ScanMatch::previous`, `AobMatch::previous`,
+  `ProcessInfo::arch` and `ModuleMap`. It is a workspace-internal library,
+  not published, so this is not a public API break — but a `ModuleMap` is
+  deliberately a *snapshot*: it goes stale when the target loads a DLL, and
+  resolves an address in a newly-loaded module to nothing rather than to
+  something wrong.
+- Still Windows-only, 64-bit targets only, single executable, nothing
+  written outside its own folder, no network, no telemetry.
+
 ## [0.3.0] — 2026-09-04
 
 [Release](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v0.3.0)
@@ -139,7 +206,8 @@ load a cheat table**.
 - Process-list icons, native file dialogs, a dark theme, and the
   application's own icon.
 
-[Unreleased]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v0.1.0
