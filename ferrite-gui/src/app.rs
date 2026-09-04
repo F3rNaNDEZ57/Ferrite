@@ -1393,58 +1393,185 @@ impl FerriteApp {
         }
     }
 
+    /// The manual-add form's body, inside its modal.
+    ///
+    /// A form with its own validation, so each fallible field owns a message
+    /// slot and the whole thing shows what the address it is building
+    /// actually resolves to before anything is added.
     fn show_manual_add_form(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Add address manually")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Description:");
-                    ui.text_edit_singleline(&mut self.manual_description);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Address:");
-                    ui.text_edit_singleline(&mut self.manual_address_text);
-                    ui.label("Pointer offsets (optional):");
-                    ui.text_edit_singleline(&mut self.manual_pointer_offsets_text);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Type:");
-                    egui::ComboBox::new("manual_value_type", "")
-                        .selected_text(self.manual_value_type.label())
-                        .show_ui(ui, |ui| {
-                            for choice in ValueTypeChoice::ALL {
-                                ui.selectable_value(
-                                    &mut self.manual_value_type,
-                                    choice,
-                                    choice.label(),
-                                );
-                            }
-                        });
-                    ui.label("Value:");
-                    ui.text_edit_singleline(&mut self.manual_value_text);
+        ui.set_width(596.0);
 
-                    if ui.button("Add").clicked() {
-                        match self.build_manual_entry() {
-                            Ok(entry) => {
-                                self.saved.push(SavedRow {
-                                    entry,
-                                    resolved_address: None,
-                                    status: RowStatus::NotAttached,
-                                });
-                                self.manual_description.clear();
-                                self.manual_address_text.clear();
-                                self.manual_pointer_offsets_text.clear();
-                                self.manual_value_text.clear();
-                                self.manual_add_error = None;
-                            }
-                            Err(err) => self.manual_add_error = Some(err),
-                        }
-                    }
-                });
-                if let Some(err) = &self.manual_add_error {
-                    ui.colored_label(theme::ACCENT_LIFT, err);
+        if self.attached.is_none() {
+            ui.label(
+                egui::RichText::new(
+                    "Nothing is attached, so this entry will read \"not attached\" until a \
+                     matching process is.",
+                )
+                .font(theme::font(theme::text_style::SECONDARY))
+                .color(theme::TEXT_FAINT),
+            );
+            ui.add_space(theme::space::SM);
+        }
+
+        ui.label(
+            egui::RichText::new("Description")
+                .font(theme::font(theme::text_style::SECONDARY))
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_sized(
+            [ui.available_width(), theme::FIELD_HEIGHT],
+            egui::TextEdit::singleline(&mut self.manual_description),
+        );
+        message_slot(ui, None, "Optional. Defaults to the address you type.");
+
+        ui.label(
+            egui::RichText::new("Address")
+                .font(theme::font(theme::text_style::SECONDARY))
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_sized(
+            [ui.available_width(), theme::FIELD_HEIGHT],
+            egui::TextEdit::singleline(&mut self.manual_address_text)
+                .font(egui::TextStyle::Name(theme::text_style::MONO_VALUE.into())),
+        );
+        let address_error = (!self.manual_address_text.trim().is_empty())
+            .then(|| parse_address_expr(&self.manual_address_text).err())
+            .flatten();
+        message_slot(
+            ui,
+            address_error.as_deref(),
+            "Absolute hex (7FF6A41C58DA) or module+offset (game.exe+1C58DA0).",
+        );
+
+        ui.label(
+            egui::RichText::new("Pointer offsets")
+                .font(theme::font(theme::text_style::SECONDARY))
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_sized(
+            [ui.available_width(), theme::FIELD_HEIGHT],
+            egui::TextEdit::singleline(&mut self.manual_pointer_offsets_text)
+                .font(egui::TextStyle::Name(theme::text_style::MONO_VALUE.into())),
+        );
+        let offsets = parse_pointer_offsets(&self.manual_pointer_offsets_text);
+        message_slot(
+            ui,
+            offsets.as_ref().err().map(String::as_str),
+            "Optional. Hex, separated by commas or spaces, outermost first.",
+        );
+
+        // The expression the two fields above add up to, written the way a
+        // saved table writes it. Shown before anything is added, because a
+        // pointer chain is exactly the kind of thing that is easy to get one
+        // level wrong and hard to notice afterwards.
+        if let (Ok(base), Ok(offsets)) = (
+            parse_address_expr(&self.manual_address_text),
+            offsets.as_ref(),
+        ) && !offsets.is_empty()
+        {
+            let base_text = match &base {
+                AddressExpr::Absolute(a) => format!("{a:X}"),
+                AddressExpr::ModuleRelative { module, offset } => {
+                    format!("{module}+{offset:X}")
                 }
+            };
+            let mut expr = format!("[{base_text}]");
+            for offset in offsets.iter().rev().skip(1).rev() {
+                expr = format!("[{expr}+{offset:X}]");
+            }
+            if let Some(last) = offsets.last() {
+                expr = format!("{expr}+{last:X}");
+            }
+            ui.label(
+                egui::RichText::new(expr)
+                    .font(theme::font(theme::text_style::MONO_VALUE))
+                    .color(theme::TEXT_DIM),
+            );
+            ui.add_space(theme::space::SM);
+        }
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("Type")
+                        .font(theme::font(theme::text_style::SECONDARY))
+                        .color(theme::TEXT_DIM),
+                );
+                egui::ComboBox::new("manual_value_type", "")
+                    .selected_text(self.manual_value_type.label())
+                    .width(160.0)
+                    .show_ui(ui, |ui| {
+                        for choice in ValueTypeChoice::ALL {
+                            ui.selectable_value(
+                                &mut self.manual_value_type,
+                                choice,
+                                choice.label(),
+                            );
+                        }
+                    });
             });
+            ui.add_space(theme::space::MD);
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("Value")
+                        .font(theme::font(theme::text_style::SECONDARY))
+                        .color(theme::TEXT_DIM),
+                );
+                ui.add_sized(
+                    [220.0, theme::FIELD_HEIGHT],
+                    egui::TextEdit::singleline(&mut self.manual_value_text)
+                        .font(egui::TextStyle::Name(theme::text_style::MONO_VALUE.into())),
+                );
+            });
+        });
+        let value_error = (!self.manual_value_text.trim().is_empty())
+            .then(|| parse_entry_value(self.manual_value_type, &self.manual_value_text).err())
+            .flatten();
+        message_slot(
+            ui,
+            value_error.as_deref(),
+            "What a freeze would pin. Not written to the target on Add.",
+        );
+
+        ui.add_space(theme::space::SM);
+        ui.horizontal(|ui| {
+            // Enabled only once the whole form builds, so Add can't produce
+            // an error - the fields have already said what is wrong.
+            let ready = self.build_manual_entry().is_ok();
+            if ui
+                .add_enabled_ui(ready, |ui| theme::primary(ui, "Add to saved list"))
+                .inner
+                .clicked()
+            {
+                match self.build_manual_entry() {
+                    Ok(entry) => {
+                        self.saved.push(SavedRow {
+                            entry,
+                            resolved_address: None,
+                            status: RowStatus::NotAttached,
+                        });
+                        self.manual_description.clear();
+                        self.manual_address_text.clear();
+                        self.manual_pointer_offsets_text.clear();
+                        self.manual_value_text.clear();
+                        self.manual_add_error = None;
+                        self.manual_add_open = false;
+                    }
+                    Err(err) => self.manual_add_error = Some(err),
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                self.manual_add_open = false;
+                self.manual_add_error = None;
+            }
+        });
+        if let Some(err) = &self.manual_add_error {
+            ui.label(
+                egui::RichText::new(err)
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(theme::ACCENT_LIFT),
+            );
+        }
     }
 
     fn build_manual_entry(&self) -> Result<CheatEntry, String> {
