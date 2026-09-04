@@ -250,10 +250,25 @@ enum RowStatus {
 impl RowStatus {
     fn label(&self) -> String {
         match self {
-            Self::NotAttached => "—".to_string(),
-            Self::Resolved => String::new(),
+            Self::NotAttached => "not attached".to_string(),
+            Self::Resolved => "resolved".to_string(),
             Self::ModuleNotFound(module) => format!("module {module:?} not found"),
-            Self::Unreadable => "unreadable".to_string(),
+            Self::Unreadable => "unreadable · page freed or protected".to_string(),
+        }
+    }
+
+    fn is_resolved(&self) -> bool {
+        matches!(self, Self::Resolved)
+    }
+
+    /// Row state is carried by ink weight and a left rule, never by hue —
+    /// red means attention here, and an entry that simply isn't resolved yet
+    /// is not something to alarm anyone about.
+    fn ink(&self) -> egui::Color32 {
+        if self.is_resolved() {
+            theme::TEXT
+        } else {
+            theme::TEXT_FAINT
         }
     }
 }
@@ -1590,66 +1605,152 @@ impl FerriteApp {
     /// The saved-list panel: shows every saved entry with its live status,
     /// independent of scan results and of attach state (see the vault's
     /// `v1-plan.md`).
+    /// The saved list, as the dock's virtualised table.
+    ///
+    /// Four row states share one shape: an entry that can't resolve keeps
+    /// its address and its place in the list rather than being dropped or
+    /// hidden. That is the whole contract of a saved table — it outlives the
+    /// process it was made against.
     fn show_saved_list_table(&mut self, ui: &mut egui::Ui) {
-        if self.saved.is_empty() {
-            return;
-        }
-
         let mut to_remove: Option<usize> = None;
+        // Split the borrows explicitly: the table body needs `&mut
+        // self.saved` while still reading the freeze handle, and
+        // FreezeHandle is not Clone.
+        let freeze = self.attached.as_ref().map(|a| &a.freeze);
+        let rows = &mut self.saved;
 
-        theme::panel(theme::SURFACE).show(ui, |ui| {
-            ui.heading("Saved list");
-
-            let freeze_handle = self.attached.as_ref().map(|a| &a.freeze);
-
-            egui::ScrollArea::vertical()
-                .id_salt("saved_list_scroll")
-                .show(ui, |ui| {
-                    egui::Grid::new("saved_list")
-                        .striped(true)
-                        .num_columns(5)
-                        .show(ui, |ui| {
-                            ui.strong("Description");
-                            ui.strong("Address");
-                            ui.strong("Value");
-                            ui.strong("Frozen");
-                            ui.strong("");
-                            ui.end_row();
-
-                            for (index, row) in self.saved.iter_mut().enumerate() {
-                                ui.text_edit_singleline(&mut row.entry.description);
-
-                                let address_text = match (row.resolved_address, &row.status) {
-                                    (Some(address), RowStatus::Resolved) => {
-                                        format!("{address:#x}")
-                                    }
-                                    (_, status) => status.label(),
-                                };
-                                ui.label(address_text);
-                                ui.label(format_entry_value(
-                                    &row.entry.value,
-                                    row.entry.show_as_hex,
-                                ));
-
-                                match freeze_handle {
-                                    Some(freeze) => show_saved_frozen_checkbox(ui, freeze, row),
-                                    None => {
-                                        let mut is_frozen = row.entry.frozen;
-                                        ui.add_enabled(
-                                            false,
-                                            egui::Checkbox::new(&mut is_frozen, ""),
-                                        );
-                                    }
-                                }
-
-                                if ui.button("Remove").clicked() {
-                                    to_remove = Some(index);
-                                }
-                                ui.end_row();
-                            }
-                        });
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("saved_table")
+            .striped(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::exact(theme::col::FREEZE))
+            .column(egui_extras::Column::remainder().at_least(160.0))
+            .column(egui_extras::Column::exact(theme::col::ADDRESS))
+            .column(egui_extras::Column::exact(theme::col::VALUE))
+            .column(egui_extras::Column::remainder().at_least(120.0))
+            .column(egui_extras::Column::exact(theme::col::ACTION))
+            .header(theme::HEADER_HEIGHT, |mut header| {
+                header.col(|ui| {
+                    theme::column_header(ui, "frz");
                 });
-        });
+                header.col(|ui| {
+                    theme::column_header(ui, "description");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "address");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "value");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "state");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "");
+                });
+            })
+            .body(|body| {
+                body.rows(theme::ROW_HEIGHT, rows.len(), |mut row| {
+                    let index = row.index();
+                    let entry = &mut rows[index];
+                    let resolved = entry.status.is_resolved();
+                    let ink = entry.status.ink();
+
+                    row.col(|ui| {
+                        // Freeze needs both an attached session and an
+                        // address to pin; without either the box is shown
+                        // but inert, so the column doesn't jump around.
+                        match (freeze, entry.resolved_address, resolved) {
+                            (Some(freeze), Some(address), true) => {
+                                let mut frozen = entry.entry.frozen;
+                                if ui.checkbox(&mut frozen, "").changed() {
+                                    if frozen {
+                                        freeze.freeze(address, entry.entry.value.to_le_bytes());
+                                    } else {
+                                        freeze.unfreeze(address);
+                                    }
+                                    entry.entry.frozen = frozen;
+                                }
+                            }
+                            _ => {
+                                let mut frozen = entry.entry.frozen;
+                                ui.add_enabled(false, egui::Checkbox::new(&mut frozen, ""));
+                            }
+                        }
+                    });
+                    row.col(|ui| {
+                        // Frameless: the description is editable in place,
+                        // but a bordered box on every row would turn the
+                        // column into a stack of form fields rather than a
+                        // column of names. The field still takes focus and
+                        // still shows a caret when clicked.
+                        ui.add(
+                            egui::TextEdit::singleline(&mut entry.entry.description)
+                                .desired_width(ui.available_width())
+                                .frame(egui::Frame::NONE)
+                                .text_color(ink),
+                        );
+                    });
+                    row.col(|ui| match entry.resolved_address {
+                        Some(address) if resolved => {
+                            ui.add(egui::Label::new(hex_address_job(address, false)).extend());
+                        }
+                        _ => {
+                            ui.label(
+                                egui::RichText::new("—")
+                                    .font(theme::font(theme::text_style::MONO_VALUE))
+                                    .color(theme::TEXT_FAINT),
+                            );
+                        }
+                    });
+                    row.col(|ui| {
+                        let text = if resolved {
+                            format_entry_value(&entry.entry.value, entry.entry.show_as_hex)
+                        } else {
+                            "—".to_string()
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(text)
+                                    .font(theme::font(theme::text_style::MONO_LIVE))
+                                    .color(ink),
+                            )
+                            .truncate(),
+                        );
+                    });
+                    row.col(|ui| {
+                        // The reason names the module in quotes, so a
+                        // wrong-target attach is obvious rather than just
+                        // "unresolved".
+                        let text = if resolved && entry.entry.frozen {
+                            "frozen".to_string()
+                        } else {
+                            entry.status.label()
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(text)
+                                    .font(theme::font(theme::text_style::SECONDARY))
+                                    .color(if resolved {
+                                        theme::TEXT_DIM
+                                    } else {
+                                        theme::TEXT_FAINT
+                                    }),
+                            )
+                            .truncate(),
+                        );
+                    });
+                    row.col(|ui| {
+                        if ui
+                            .add(egui::Button::new("×").frame(false))
+                            .on_hover_text("Remove from the saved list")
+                            .clicked()
+                        {
+                            to_remove = Some(index);
+                        }
+                    });
+                });
+            });
 
         if let Some(index) = to_remove {
             let removed = self.saved.remove(index);
@@ -1660,29 +1761,6 @@ impl FerriteApp {
                 freeze.unfreeze(address);
             }
         }
-    }
-}
-
-/// Renders a saved-list row's "Frozen" checkbox. Unlike
-/// `show_frozen_checkbox` (results-table rows, which have no persisted
-/// frozen flag of their own), this also keeps `row.entry.frozen` in sync so
-/// the state round-trips through save/load. Disabled (read-only) when the
-/// row hasn't resolved to a live address - there's no `FreezeHandle` entry
-/// to toggle without one.
-fn show_saved_frozen_checkbox(ui: &mut egui::Ui, freeze: &FreezeHandle, row: &mut SavedRow) {
-    let Some(address) = row.resolved_address else {
-        let mut is_frozen = row.entry.frozen;
-        ui.add_enabled(false, egui::Checkbox::new(&mut is_frozen, ""));
-        return;
-    };
-    let mut is_frozen = freeze.is_frozen(address);
-    if ui.checkbox(&mut is_frozen, "").changed() {
-        if is_frozen {
-            freeze.freeze(address, row.entry.value.to_le_bytes());
-        } else {
-            freeze.unfreeze(address);
-        }
-        row.entry.frozen = is_frozen;
     }
 }
 
