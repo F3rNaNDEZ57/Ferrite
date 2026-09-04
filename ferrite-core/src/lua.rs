@@ -1,10 +1,10 @@
 //! A deliberately crippled Lua interpreter for running the data-only
 //! `{$LUA}` blocks of a cheat-table script.
 //!
-//! This module provides the *environment*. The Cheat Engine API a script
-//! actually calls — `readInteger`, `writeInteger` and the rest — is a
-//! separate concern and not here yet; a script run through this today can
-//! compute and print, and reach nothing else at all.
+//! This module provides the *environment*: the sandbox, the instruction
+//! budget, and the `{$LUA}` block plumbing. The Cheat Engine API a script
+//! calls — `readInteger`, `writeInteger` and the rest — lives in
+//! [`crate::lua_api`], which is installed into each interpreter here.
 //!
 //! ## The safety model, and exactly what backs it
 //!
@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex};
 
 use mlua::{HookTriggers, Lua, LuaOptions, StdLib, VmState};
 
+use crate::lua_api::{self, ScriptContext};
 use crate::script::{Script, ScriptKind, Section};
 
 /// Globals that exist in Lua's base library and have to be removed rather
@@ -142,6 +143,7 @@ pub struct RunOutput {
 pub fn run_section(
     script: &Script,
     section: Section,
+    ctx: &ScriptContext,
     syntax_check: bool,
     budget: u64,
 ) -> Result<RunOutput, LuaError> {
@@ -154,6 +156,9 @@ pub fn run_section(
     for block in script.lua_blocks(section) {
         let printed = Arc::new(Mutex::new(Vec::new()));
         let lua = sandboxed(Arc::clone(&printed), budget)?;
+        // The API goes in after the sandbox, so a name it installs can
+        // never be one the sandbox was meant to have removed.
+        lua_api::install(&lua, ctx).map_err(|e| LuaError::Lua(e.to_string()))?;
 
         // Prepend exactly what Cheat Engine prepends. Real scripts refer to
         // these by name — `if syntaxcheck then return end` is the standard
@@ -272,7 +277,13 @@ mod tests {
 
     fn run(source: &str) -> Result<RunOutput, LuaError> {
         let script = parse_script(source).expect("the fixture parses");
-        run_section(&script, Section::Enable, false, DEFAULT_INSTRUCTION_BUDGET)
+        run_section(
+            &script,
+            Section::Enable,
+            &ScriptContext::detached(),
+            false,
+            DEFAULT_INSTRUCTION_BUDGET,
+        )
     }
 
     /// Evaluates an expression inside the sandbox and reports whether it was
@@ -345,7 +356,13 @@ mod tests {
         // The reason the budget exists: this is someone else's code running
         // while the user waits.
         let script = parse_script("{$lua}\nwhile true do end").expect("parses");
-        let result = run_section(&script, Section::Enable, false, 100_000);
+        let result = run_section(
+            &script,
+            Section::Enable,
+            &ScriptContext::detached(),
+            false,
+            100_000,
+        );
         assert_eq!(
             result,
             Err(LuaError::BudgetExhausted { budget: 100_000 }),
@@ -370,8 +387,14 @@ mod tests {
         // would break every script written against Cheat Engine.
         let script =
             parse_script("{$lua}\nprint(syntaxcheck)\nprint(memrec == nil)").expect("parses");
-        let out =
-            run_section(&script, Section::Enable, true, DEFAULT_INSTRUCTION_BUDGET).expect("runs");
+        let out = run_section(
+            &script,
+            Section::Enable,
+            &ScriptContext::detached(),
+            true,
+            DEFAULT_INSTRUCTION_BUDGET,
+        )
+        .expect("runs");
         assert_eq!(out.printed, vec!["true".to_string(), "true".to_string()]);
     }
 
@@ -386,13 +409,25 @@ mod tests {
         )
         .expect("parses");
 
-        let checking = run_section(&script, Section::Enable, true, DEFAULT_INSTRUCTION_BUDGET)
-            .expect("runs under a syntax check");
+        let checking = run_section(
+            &script,
+            Section::Enable,
+            &ScriptContext::detached(),
+            true,
+            DEFAULT_INSTRUCTION_BUDGET,
+        )
+        .expect("runs under a syntax check");
         assert!(checking.printed.is_empty(), "it should not have acted");
         assert_eq!(checking.returned, None);
 
-        let acting = run_section(&script, Section::Enable, false, DEFAULT_INSTRUCTION_BUDGET)
-            .expect("runs for real");
+        let acting = run_section(
+            &script,
+            Section::Enable,
+            &ScriptContext::detached(),
+            false,
+            DEFAULT_INSTRUCTION_BUDGET,
+        )
+        .expect("runs for real");
         assert_eq!(acting.printed, vec!["acted".to_string()]);
     }
 
@@ -410,12 +445,24 @@ mod tests {
         )
         .expect("parses");
 
-        let on =
-            run_section(&script, Section::Enable, false, DEFAULT_INSTRUCTION_BUDGET).expect("runs");
+        let on = run_section(
+            &script,
+            Section::Enable,
+            &ScriptContext::detached(),
+            false,
+            DEFAULT_INSTRUCTION_BUDGET,
+        )
+        .expect("runs");
         assert_eq!(on.printed, vec!["on: preamble".to_string()]);
 
-        let off = run_section(&script, Section::Disable, false, DEFAULT_INSTRUCTION_BUDGET)
-            .expect("runs");
+        let off = run_section(
+            &script,
+            Section::Disable,
+            &ScriptContext::detached(),
+            false,
+            DEFAULT_INSTRUCTION_BUDGET,
+        )
+        .expect("runs");
         assert_eq!(off.printed, vec!["off: preamble".to_string()]);
     }
 
@@ -432,7 +479,13 @@ mod tests {
              mov eax,1",
         )
         .expect("parses");
-        let result = run_section(&script, Section::Enable, false, DEFAULT_INSTRUCTION_BUDGET);
+        let result = run_section(
+            &script,
+            Section::Enable,
+            &ScriptContext::detached(),
+            false,
+            DEFAULT_INSTRUCTION_BUDGET,
+        );
         assert_eq!(result, Err(LuaError::NotRunnable(ScriptKind::Assembler)));
     }
 
@@ -450,7 +503,13 @@ mod tests {
         };
         assert_eq!(script.kind(), ScriptKind::GenerativeLua);
         assert_eq!(
-            run_section(&script, Section::Enable, false, DEFAULT_INSTRUCTION_BUDGET),
+            run_section(
+                &script,
+                Section::Enable,
+                &ScriptContext::detached(),
+                false,
+                DEFAULT_INSTRUCTION_BUDGET,
+            ),
             Err(LuaError::NotRunnable(ScriptKind::GenerativeLua)),
             "the side effect must not have run"
         );
@@ -481,8 +540,14 @@ mod tests {
         .expect("parses");
         assert_eq!(script.kind(), ScriptKind::DataOnlyLua);
 
-        let out =
-            run_section(&script, Section::Enable, false, DEFAULT_INSTRUCTION_BUDGET).expect("runs");
+        let out = run_section(
+            &script,
+            Section::Enable,
+            &ScriptContext::detached(),
+            false,
+            DEFAULT_INSTRUCTION_BUDGET,
+        )
+        .expect("runs");
         assert_eq!(out.printed, vec!["true".to_string()]);
     }
 }

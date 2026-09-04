@@ -187,6 +187,13 @@ impl ModuleMap {
         self.sorted.len()
     }
 
+    /// The snapshot's modules, sorted by base address. Exposed for the
+    /// script API's `enumModules` and `getModuleSize`, which need the list
+    /// rather than a single lookup.
+    pub fn modules(&self) -> &[ModuleInfo] {
+        &self.sorted
+    }
+
     /// Resolves `address` to the module containing it, or `None` if it falls
     /// in no module's image — which is the common case for a heap or stack
     /// address, not an error.
