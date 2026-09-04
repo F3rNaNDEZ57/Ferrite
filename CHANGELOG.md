@@ -10,6 +10,61 @@ Pre-1.0, a minor version bump may carry a breaking change — see `0.2.0`.
 
 Nothing yet.
 
+## [1.1.2] — 2026-09-04
+
+[Release](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.1.2)
+
+### Fixed
+
+- **Lua that injects code is no longer offered as runnable.** A `{$LUA}`
+  script that calls `autoAssemble`, `allocateMemory`, `executeCode`,
+  `injectDLL` or the debugger functions was classified as data-only, so
+  Ferrite showed an **Enable** button for it. Pressing that button always
+  failed, because those functions do not exist in Ferrite's interpreter.
+
+  The button was the bug. Such a script is now labelled *"Lua, injects
+  code"* and refused up front, with a reason that says why.
+
+  Nothing unsafe was possible either way — the missing functions are
+  missing by design, so the script died on its first injecting call. What
+  was wrong was the promise.
+
+### Why it was wrong
+
+v1.1.0 was built on the distinction that a Lua script acts through
+ordinary reads and writes while an Auto Assembler script injects code.
+That distinction is real, but it describes **what a script does, not which
+language it is written in** — and the classifier conflated the two.
+
+Most modern cheat tables are written the second way. Every line is Lua, so
+nothing in the source looks like assembly:
+
+```lua
+addr   = AOBScanModuleUnique(process, "0F 57 C9 0F 2F C1 76 ??")
+newmem = allocateMemory(100, addr)
+autoAssemble("jmp newmem\nnop", false)
+```
+
+That scans for a byte signature, allocates memory inside the target,
+assembles instructions and patches execution. It is exactly what an Auto
+Assembler script does, reached through a different door.
+
+A script that only reads and writes is still runnable — `readBytes` beside
+`autoAssemble` is an injecting script, but `readBytes` alone is not.
+
+### How it was found
+
+By importing three real Grounded tables rather than test fixtures. The
+largest declared 24 cheats, and Ferrite offered to run every one of them.
+Not one would have worked.
+
+Worth knowing if you are trying tables of your own: **all 24 of that
+table's cheats, and every cheat in the two others, need code injection**.
+Ferrite does not do that, and it is not planned. A separate finding from
+the same tables: none of their *value* entries import either, because they
+are addressed by user-defined symbols the table registers at runtime
+rather than by address or `module.exe+offset`.
+
 ## [1.1.1] — 2026-09-04
 
 [Release](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.1.1)
@@ -313,7 +368,8 @@ load a cheat table**.
 - Process-list icons, native file dialogs, a dark theme, and the
   application's own icon.
 
-[Unreleased]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.3.0...v1.0.0

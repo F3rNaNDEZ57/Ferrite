@@ -12,7 +12,7 @@ by construction, and maintained in the open.
 
 ## Status
 
-**v1.1.1 is out.** The full core loop works and is verified against a real
+**v1.1.2 is out.** The full core loop works and is verified against a real
 target process: **attach → scan → filter (next scan) → edit / freeze →
 save & load a cheat table** (our own JSON format, plus importing existing
 Cheat Engine `.CT` tables).
@@ -45,7 +45,13 @@ Cheat Engine `.CT` tables).
   inject code or reach your filesystem or network do not exist. Nothing
   runs without being read and agreed to first — including a table's own
   `<LuaScript>`, which Cheat Engine would run on open and which Ferrite
-  shows you instead. **Auto Assembler scripts
+  shows you instead.
+
+  **Expect most downloaded tables not to run.** Their cheats are usually
+  code injection — either plain Auto Assembler, or Lua that calls
+  `allocateMemory` and `autoAssemble`, which amounts to the same thing.
+  The import report labels each entry so you can tell at a glance rather
+  than by trial. **Auto Assembler scripts
   are still never executed** — those allocate memory inside the target and
   patch its execution, and Ferrite does neither. The import report labels
   which kind each entry is, and shows you the script text either way.
