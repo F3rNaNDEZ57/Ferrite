@@ -16,6 +16,7 @@ pub mod process;
 pub mod regions;
 pub mod scan;
 pub mod scan_value;
+pub mod script;
 pub mod session;
 pub mod table;
 pub mod text;
@@ -35,6 +36,7 @@ pub use scan::{
     FirstScanResult, ScanMatch, ScanOptions, first_scan_exact, next_scan, scan_region_exact,
 };
 pub use scan_value::{ScanFilter, ScanValue, bytes_match_exact, passes_filter};
+pub use script::{Block, Script, ScriptError, ScriptKind, Section, parse_script};
 pub use session::{AttachError, MemoryError, ProcessSession};
 pub use table::{
     AddressExpr, CheatEntry, EntryValue, ResolveError, TableError, load_table, parse_address_expr,

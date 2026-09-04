@@ -15,6 +15,7 @@ use serde::Deserialize;
 
 use crate::pointer::MAX_POINTER_CHAIN_DEPTH;
 use crate::scan_value::ScanValue;
+use crate::script::{ScriptKind, parse_script};
 use crate::table::{CheatEntry, EntryValue, parse_address_expr, parse_hex_usize};
 use crate::text::TextEncoding;
 
@@ -104,6 +105,11 @@ pub struct SkippedEntry {
     /// what a table's script *would* have done and judge it by hand.
     /// Nothing here executes it, and this is not a step toward that.
     pub script_text: Option<String>,
+    /// What kind of script it is, where there is one — see
+    /// [`crate::script`]. Present so the report can distinguish a script
+    /// Ferrite could never run from one it merely doesn't run *yet*, which
+    /// are very different things to tell someone.
+    pub script_kind: Option<ScriptKind>,
 }
 
 /// The result of importing a `.CT` file.
@@ -201,11 +207,41 @@ fn import_entries(entries: &[CheatEntryXml], group_path: &str, report: &mut Impo
                     ..cheat_entry
                 });
             }
-            Err(reason) => report.skipped.push(SkippedEntry {
-                description: full_description,
-                reason,
-                script_text: script_text_of(entry),
-            }),
+            Err(reason) => {
+                let script_text = script_text_of(entry);
+                // Classify before reporting, so the reason can name what
+                // the script actually is rather than only its type string.
+                let script_kind = script_text
+                    .as_deref()
+                    .map(|text| parse_script(text).map(|s| s.kind()));
+                // Where the script was classified, the classification *is*
+                // the reason. Prefixing it with the generic "Auto Assembler
+                // Script entries aren't supported" adds nothing and is
+                // actively misleading for a data-only Lua entry, which is
+                // not an assembler script in any sense that matters.
+                let reason = match &script_kind {
+                    Some(Ok(kind)) => {
+                        let reason = kind.reason();
+                        let mut chars = reason.chars();
+                        match chars.next() {
+                            Some(first) => {
+                                first.to_uppercase().collect::<String>() + chars.as_str()
+                            }
+                            None => reason.to_string(),
+                        }
+                    }
+                    // An unparseable script is worth saying so about: it
+                    // means Cheat Engine would reject it too.
+                    Some(Err(err)) => format!("The script couldn't be read — {err}."),
+                    None => reason,
+                };
+                report.skipped.push(SkippedEntry {
+                    description: full_description,
+                    reason,
+                    script_text,
+                    script_kind: script_kind.and_then(Result::ok),
+                });
+            }
         }
     }
 }
@@ -217,7 +253,15 @@ fn import_entries(entries: &[CheatEntryXml], group_path: &str, report: &mut Impo
 /// content* is the script, so it's the only one where showing the text
 /// explains the skip rather than adding noise to it.
 fn script_text_of(entry: &CheatEntryXml) -> Option<String> {
-    if entry.variable_type.as_deref() != Some("Auto Assembler Script") {
+    // Case-insensitively, like every other type comparison since v0.3.0 —
+    // this one was left exact by mistake, so a table writing
+    // `auto assembler script` in lower case was classified as a script
+    // entry and then had its script text dropped.
+    let is_script = entry
+        .variable_type
+        .as_deref()
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("auto assembler script"));
+    if !is_script {
         return None;
     }
     entry
@@ -490,6 +534,7 @@ fn strip_one_quote_pair(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::script::ScriptKind;
     use crate::table::AddressExpr;
 
     /// These fixtures are synthetic, hand-written to the schema verified in
@@ -510,7 +555,16 @@ mod tests {
         assert_eq!(report.imported.len(), 0);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].description, "Enable +info");
-        assert!(report.skipped[0].reason.contains("Auto Assembler Script"));
+        // The reason is the classification, not the type name: this entry's
+        // whole body is a `{$LUA}` block that only prints, so it is exactly
+        // the shape a data-only interpreter could run.
+        assert_eq!(
+            report.skipped[0].script_kind,
+            Some(ScriptKind::DataOnlyLua),
+            "reason was: {}",
+            report.skipped[0].reason
+        );
+        assert!(report.skipped[0].reason.contains("data-only Lua"));
 
         // The script text comes along so a user can read what the entry
         // would have done - display only, never executed.
@@ -677,6 +731,76 @@ mod tests {
         ))
         .expect("parsing");
         assert!(report.imported[0].show_as_hex);
+    }
+
+    #[test]
+    fn the_script_fixture_classifies_every_shape() {
+        let report = import_ct_xml(&load_fixture("scripts.CT")).expect("parsing scripts.CT");
+
+        // Nothing runs, and nothing imports: no interpreter exists yet, and
+        // an Auto Assembler entry has no address to import as a value.
+        assert_eq!(report.imported.len(), 0);
+        assert_eq!(report.skipped.len(), 7, "{:#?}", report.skipped);
+
+        let by = |description: &str| {
+            report
+                .skipped
+                .iter()
+                .find(|s| s.description == description)
+                .unwrap_or_else(|| panic!("{description:?} should be skipped"))
+        };
+
+        let expected = [
+            ("Infinite health (data only)", Some(ScriptKind::DataOnlyLua)),
+            (
+                "Damage multiplier (generates code)",
+                Some(ScriptKind::GenerativeLua),
+            ),
+            ("God mode (no damage)", Some(ScriptKind::Assembler)),
+            (
+                "Ammo hook (Lua helper plus assembly)",
+                Some(ScriptKind::Assembler),
+            ),
+            ("Placeholder (comments only)", Some(ScriptKind::Empty)),
+            // Cheat Engine rejects two [ENABLE] sections outright, so this
+            // one has no classification at all.
+            ("Malformed (two enable sections)", None),
+            ("Lower-case type name", Some(ScriptKind::DataOnlyLua)),
+        ];
+        for (description, kind) in expected {
+            assert_eq!(
+                by(description).script_kind,
+                kind,
+                "wrong classification for {description:?}"
+            );
+        }
+
+        // Only the data-only ones could ever run, and the reason says which
+        // is which rather than reporting them all as "not supported".
+        assert!(
+            by("God mode (no damage)")
+                .reason
+                .contains("patching its execution")
+        );
+        assert!(
+            by("Damage multiplier (generates code)")
+                .reason
+                .contains("partly modified")
+        );
+        assert!(
+            by("Malformed (two enable sections)")
+                .reason
+                .contains("more than one [ENABLE]")
+        );
+
+        // Every one of them keeps its script text, including the
+        // lower-case-typed entry that used to lose it.
+        for (description, _) in expected {
+            assert!(
+                by(description).script_text.is_some(),
+                "{description:?} lost its script text"
+            );
+        }
     }
 
     #[test]

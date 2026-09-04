@@ -11,10 +11,10 @@ use crate::theme;
 use ferrite_core::{
     AddressExpr, AobFilter, AobMatch, AttachError, CheatEntry, DEFAULT_FREEZE_INTERVAL, EntryValue,
     FreezeHandle, ImportReport, ModuleMap, ProcessInfo, ProcessSession, ResolveError, ScanFilter,
-    ScanMatch, ScanOptions, ScanValue, TextEncoding, decode_text, encode_text, extract_icon_rgba,
-    first_scan_aob, first_scan_exact, format_pattern, import_ct_file, load_table, next_scan,
-    next_scan_aob, parse_address_expr, parse_hex_pattern, parse_pointer_offsets, resolve_address,
-    save_table,
+    ScanMatch, ScanOptions, ScanValue, ScriptKind, TextEncoding, decode_text, encode_text,
+    extract_icon_rgba, first_scan_aob, first_scan_exact, format_pattern, import_ct_file,
+    load_table, next_scan, next_scan_aob, parse_address_expr, parse_hex_pattern,
+    parse_pointer_offsets, resolve_address, save_table,
 };
 
 /// How many result rows the table actually renders. Independent of
@@ -1844,6 +1844,8 @@ impl FerriteApp {
                                         // kind you can open, so only it gets
                                         // an affordance.
                                         if lines > 0 {
+                                            ui.add_space(theme::space::SM);
+                                            script_kind_chip(ui, entry.script_kind);
                                             if ui
                                                 .selectable_label(
                                                     is_selected,
@@ -1886,12 +1888,21 @@ impl FerriteApp {
             .selected_skip
             .and_then(|index| report.skipped.get(index))
         else {
+            // The count has to come from the report; an earlier draft
+            // hardcoded "Nine", which was simply wrong for any other table.
+            let with_script = report
+                .skipped
+                .iter()
+                .filter(|s| s.script_text.is_some())
+                .count();
             empty_state(
                 ui,
                 "Pick an entry to read its script",
-                "Nine of these carry an Auto Assembler or Lua script. Ferrite never runs \
-                 one — the text is here so you can read what the table would have done \
-                 and decide for yourself.",
+                &format!(
+                    "{with_script} of these carry an Auto Assembler or Lua script. Ferrite \
+                     runs none of them — the text is here so you can read what the table \
+                     would have done and decide for yourself."
+                ),
             );
             return;
         };
@@ -2132,6 +2143,44 @@ fn parse_entry_value(value_type: ValueTypeChoice, text: &str) -> Result<EntryVal
     } else {
         value_type.parse(text).map(EntryValue::Scalar)
     }
+}
+
+/// A short label for what kind of script a skipped entry carries.
+///
+/// The reason line already spells this out; the chip exists so sixteen
+/// skipped rows can be scanned at a glance for the one thing that decides
+/// what a reader can do about them. Deliberately not colour-coded green /
+/// red: in this palette red means attention, and none of these is an error
+/// — they are facts about the table.
+fn script_kind_chip(ui: &mut egui::Ui, kind: Option<ScriptKind>) {
+    let (text, hover) = match kind {
+        Some(ScriptKind::DataOnlyLua) => (
+            "data-only Lua",
+            "Reads and writes values only. This is the kind Ferrite could run.",
+        ),
+        Some(ScriptKind::GenerativeLua) => (
+            "generates code",
+            "Its Lua returns assembly, so running only the Lua would leave the              target partly modified.",
+        ),
+        Some(ScriptKind::Assembler) => (
+            "Auto Assembler",
+            "Assembles code, allocates memory inside the target and patches its              execution. Ferrite does none of that.",
+        ),
+        Some(ScriptKind::Empty) => ("no code", "The script has no statements in either half."),
+        None => (
+            "unreadable",
+            "The script couldn't be parsed — Cheat Engine would reject it too.",
+        ),
+    };
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .font(theme::font(theme::text_style::SECONDARY))
+                .color(theme::TEXT_FAINT),
+        )
+        .selectable(false),
+    )
+    .on_hover_text(hover);
 }
 
 /// A byte count at a scale that stays readable: a small target reported as

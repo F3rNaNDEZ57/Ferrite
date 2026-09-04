@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Every script shape the classifier has to tell apart, in one table.
+
+  Synthetic and hand-written to the schema verified from Cheat Engine's own
+  source (see the vault's v1.1-plan) - not copies of real downloaded tables,
+  which are third-party files of unclear licence and don't belong in this
+  repo. The assembly is representative of a real god-mode hook rather than
+  being valid for any actual game.
+-->
+<CheatTable CheatEngineTableVersion="45">
+  <CheatEntries>
+
+    <!-- 1. Data-only Lua: the shape a data-only interpreter could run.
+            Note the shared preamble above [ENABLE]: it belongs to both
+            halves, and its bare `return` must not read as generative. -->
+    <CheatEntry>
+      <ID>1</ID>
+      <Description>"Infinite health (data only)"</Description>
+      <LastState/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>{$lua}
+if syntaxcheck then return end
+local health = getAddress("game.exe+1C58DA0")
+[ENABLE]
+writeInteger(health, 1000)
+[DISABLE]
+writeInteger(health, 100)
+</AssemblerScript>
+    </CheatEntry>
+
+    <!-- 2. Generative Lua: the block returns a string, which Cheat Engine
+            would substitute into the script as assembly. Running only its
+            Lua half would leave the target partly modified. -->
+    <CheatEntry>
+      <ID>2</ID>
+      <Description>"Damage multiplier (generates code)"</Description>
+      <LastState/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>{$lua}
+if syntaxcheck then return end
+[ENABLE]
+return string.format("db %02X", 0x90)
+[DISABLE]
+return "db 8B"
+</AssemblerScript>
+    </CheatEntry>
+
+    <!-- 3. Plain Auto Assembler: what most real god-mode cheats are. -->
+    <CheatEntry>
+      <ID>3</ID>
+      <Description>"God mode (no damage)"</Description>
+      <LastState/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+aobscanmodule(damageHook,game.exe,48 8B 4E 18 89 46 1C)
+alloc(newmem,$1000,damageHook)
+label(code)
+label(return)
+
+newmem:
+  mov [rsi+1C],#100
+  jmp return
+
+damageHook:
+  jmp newmem
+  nop
+code:
+  mov [rsi+1C],eax
+  jmp return
+
+registersymbol(damageHook)
+
+[DISABLE]
+damageHook:
+  db 48 8B 4E 18 89 46 1C
+unregistersymbol(damageHook)
+dealloc(newmem)
+</AssemblerScript>
+    </CheatEntry>
+
+    <!-- 4. Mixed: a Lua helper block beside real assembly. Ferrite could
+            run the first half and not the second, which is precisely the
+            half-application to refuse. -->
+    <CheatEntry>
+      <ID>4</ID>
+      <Description>"Ammo hook (Lua helper plus assembly)"</Description>
+      <LastState/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+print("preparing the ammo hook")
+{$asm}
+aobscanmodule(ammoHook,game.exe,89 46 20)
+ammoHook:
+  mov [rsi+20],#999
+[DISABLE]
+ammoHook:
+  db 89 46 20
+</AssemblerScript>
+    </CheatEntry>
+
+    <!-- 5. Comments only: nothing to run in either half. -->
+    <CheatEntry>
+      <ID>5</ID>
+      <Description>"Placeholder (comments only)"</Description>
+      <LastState/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>// TODO: work out the health offset for this build
+{ this whole block is a comment }
+</AssemblerScript>
+    </CheatEntry>
+
+    <!-- 6. Two [ENABLE] sections: Cheat Engine rejects this outright rather
+            than merging them, so Ferrite must too. -->
+    <CheatEntry>
+      <ID>6</ID>
+      <Description>"Malformed (two enable sections)"</Description>
+      <LastState/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+writeInteger(a, 1)
+[ENABLE]
+writeInteger(b, 2)
+</AssemblerScript>
+    </CheatEntry>
+
+    <!-- 7. Lower-case type name, to hold the case-insensitive comparison in
+            place. Written exact until v1.1, which meant this entry's script
+            text was silently dropped. -->
+    <CheatEntry>
+      <ID>7</ID>
+      <Description>"Lower-case type name"</Description>
+      <LastState/>
+      <VariableType>auto assembler script</VariableType>
+      <AssemblerScript>{$lua}
+writeInteger(getAddress("game.exe+100"), 7)
+</AssemblerScript>
+    </CheatEntry>
+
+  </CheatEntries>
+</CheatTable>
