@@ -8,6 +8,7 @@ repository.workspace = true
 description = "GUI-free core: process attach, memory scanning, and read/write primitives for Ferrite."
 
 [dependencies]
+mlua = { version = "0.12", features = ["lua54", "vendored"] }
 quick-xml = { version = "0.37", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
