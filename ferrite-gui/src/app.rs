@@ -346,6 +346,14 @@ pub struct FerriteApp {
     scan_history: Vec<usize>,
     /// Whether the manual-add modal is open.
     manual_add_open: bool,
+    /// Index into the import report's skipped list whose script is being
+    /// read, if any. The list keeps its scroll position while you read one
+    /// script after another, which is what a person actually does with a
+    /// downloaded table.
+    selected_skip: Option<usize>,
+    /// Whether the script pane soft-wraps. Off by default: assembly and Lua
+    /// are line-oriented, and wrapping makes a long line look like two.
+    script_wrap: bool,
     /// When each address last changed, for the flash-on-change decay. Keyed
     /// by address, cleared with the results it belongs to.
     changed_at: HashMap<usize, f64>,
@@ -383,6 +391,8 @@ impl FerriteApp {
             scan_region_summary: None,
             scan_history: Vec::new(),
             manual_add_open: false,
+            selected_skip: None,
+            script_wrap: false,
             changed_at: HashMap::new(),
         }
     }
@@ -1542,75 +1552,281 @@ impl FerriteApp {
     /// and reason, not just a log line, plus the informational note about
     /// entries that were frozen in the source table (see
     /// `ImportReport::was_active_in_source` in `ferrite-core::ct_import`).
-    fn show_import_report(&mut self, ui: &mut egui::Ui) {
+    /// The import report.
+    ///
+    /// A first-class screen rather than an error dump: it exists so someone
+    /// can read what a downloaded table would have done *before* trusting
+    /// it, which is the decision an embedded script actually asks of them.
+    /// Ferrite never assembles, injects or runs any of it — the script pane
+    /// is text on a page.
+    ///
+    /// Split side by side when there is room, stacked below 1200 px. Split
+    /// rather than modal so the list keeps its scroll position while you
+    /// read one script after another.
+    fn show_import_report(&mut self, ui: &mut egui::Ui, window_width: f32) {
         let Some(report) = &self.import_report else {
             return;
         };
+        let imported = report.imported.len();
+        let skipped = report.skipped.len();
+        let with_script = report
+            .skipped
+            .iter()
+            .filter(|s| s.script_text.is_some())
+            .count();
+        let was_active = report.was_active_in_source.len();
 
-        if !report.was_active_in_source.is_empty() {
-            ui.label(format!(
-                "{} entries were active (frozen) in the source table; freeze is off after import - re-check them if you want that back.",
-                report.was_active_in_source.len()
-            ));
-        }
-
-        if report.skipped.is_empty() {
+        ui.horizontal(|ui| {
+            theme::section_label(ui, "import report");
+            ui.add_space(theme::space::SM);
+            ui.label(
+                egui::RichText::new(format!(
+                    "{imported} of {} entries imported",
+                    imported + skipped
+                ))
+                .font(theme::font(theme::text_style::MONO_LIVE))
+                .color(theme::TEXT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Dismiss").clicked() {
+                    self.import_report = None;
+                    self.selected_skip = None;
+                }
+            });
+        });
+        if self.import_report.is_none() {
             return;
         }
-        ui.label(format!(
-            "{} entries couldn't be imported:",
-            report.skipped.len()
-        ));
+        ui.add_space(theme::space::XS);
+
+        let mut facts = vec![format!("{skipped} skipped")];
+        if with_script > 0 {
+            facts.push(format!("{with_script} of them carry a script"));
+        }
+        if was_active > 0 {
+            facts.push(format!("{was_active} were frozen in the source"));
+        }
+        ui.label(
+            egui::RichText::new(format!(
+                "{}. Nothing was executed to produce this report.",
+                facts.join(" · ")
+            ))
+            .font(theme::font(theme::text_style::SECONDARY))
+            .color(theme::TEXT_DIM),
+        );
+        if was_active > 0 {
+            ui.label(
+                egui::RichText::new(
+                    "Freeze is off on every imported entry — re-check the ones you want.",
+                )
+                .font(theme::font(theme::text_style::SECONDARY))
+                .color(theme::TEXT_FAINT),
+            );
+        }
+        ui.add_space(theme::space::MD);
+
+        if skipped == 0 {
+            return;
+        }
+
+        let split = window_width >= theme::breakpoint::REPORT_SPLIT;
+        if split {
+            let available = ui.available_width();
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(available * 0.52, ui.available_height()),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| self.show_skipped_list(ui),
+                );
+                ui.painter().vline(
+                    ui.cursor().left(),
+                    ui.max_rect().y_range(),
+                    theme::divider_stroke(),
+                );
+                ui.add_space(theme::space::MD);
+                ui.vertical(|ui| self.show_script_pane(ui));
+            });
+        } else {
+            self.show_skipped_list(ui);
+            ui.add_space(theme::space::MD);
+            self.show_script_pane(ui);
+        }
+    }
+
+    /// The skipped entries, each with its reason.
+    ///
+    /// Not the virtualised table: a row carries a two-line reason, and
+    /// sixteen skipped entries out of forty-seven is a long list but not a
+    /// large one, so it is a list rather than a table pretending to scale.
+    fn show_skipped_list(&mut self, ui: &mut egui::Ui) {
+        let Some(report) = &self.import_report else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            theme::column_header(ui, "skipped entry");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                theme::column_header(ui, "script");
+            });
+        });
+        ui.add_space(theme::space::XS);
+
+        let mut newly_selected = None;
         egui::ScrollArea::vertical()
-            .id_salt("import_report_scroll")
-            .max_height(150.0)
+            .id_salt("skipped_list")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Grid::new("import_report")
-                    .striped(true)
-                    .num_columns(2)
-                    .show(ui, |ui| {
-                        for skipped in &report.skipped {
-                            ui.label(&skipped.description);
-                            // A script can run to dozens of lines, so it
-                            // gets a collapsed section of its own rather
-                            // than being crammed into this two-column row.
-                            // Collapsed by default: it's there to be read
-                            // on purpose, not to bury the reasons for every
-                            // other skipped entry under a wall of text.
-                            ui.vertical(|ui| {
-                                ui.colored_label(theme::ACCENT_LIFT, &skipped.reason);
-                                if let Some(script) = &skipped.script_text {
-                                    egui::CollapsingHeader::new("Show script")
-                                        .id_salt(("import_script", &skipped.description))
-                                        .default_open(false)
-                                        .show(ui, |ui| {
+                for (index, entry) in report.skipped.iter().enumerate() {
+                    let is_selected = self.selected_skip == Some(index);
+                    let lines = entry
+                        .script_text
+                        .as_ref()
+                        .map(|s| s.lines().count())
+                        .unwrap_or(0);
+
+                    let response = ui.allocate_ui(
+                        egui::vec2(ui.available_width(), theme::REASON_ROW_HEIGHT),
+                        |ui| {
+                            if is_selected {
+                                ui.painter()
+                                    .rect_filled(ui.max_rect(), 0.0, theme::ACCENT_WASH);
+                            }
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&entry.description)
+                                                .color(theme::TEXT),
+                                        )
+                                        .truncate()
+                                        .selectable(false),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&entry.reason)
+                                                .font(theme::font(theme::text_style::SECONDARY))
+                                                .color(theme::TEXT_DIM),
+                                        )
+                                        .truncate()
+                                        .selectable(false),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        // A row with a script is the only
+                                        // kind you can open, so only it gets
+                                        // an affordance.
+                                        if lines > 0 {
+                                            if ui
+                                                .selectable_label(
+                                                    is_selected,
+                                                    format!("{lines} lines"),
+                                                )
+                                                .clicked()
+                                            {
+                                                newly_selected = Some(index);
+                                            }
+                                        } else {
                                             ui.label(
-                                                "Ferrite never runs these - shown so you can \
-                                                 read what the table would have done.",
+                                                egui::RichText::new("—").color(theme::TEXT_FAINT),
                                             );
-                                            ui.add(
-                                                egui::TextEdit::multiline(&mut script.as_str())
-                                                    .code_editor()
-                                                    .desired_width(f32::INFINITY),
-                                            );
-                                        });
-                                }
+                                        }
+                                    },
+                                );
                             });
-                            ui.end_row();
-                        }
-                    });
+                        },
+                    );
+                    let _ = response;
+                    ui.painter().hline(
+                        ui.max_rect().x_range(),
+                        ui.cursor().top(),
+                        egui::Stroke::new(1.0, theme::STROKE),
+                    );
+                }
+            });
+
+        if let Some(index) = newly_selected {
+            self.selected_skip = Some(index);
+        }
+    }
+
+    /// The selected entry's script, in full.
+    fn show_script_pane(&mut self, ui: &mut egui::Ui) {
+        let Some(report) = &self.import_report else {
+            return;
+        };
+        let Some(entry) = self
+            .selected_skip
+            .and_then(|index| report.skipped.get(index))
+        else {
+            empty_state(
+                ui,
+                "Pick an entry to read its script",
+                "Nine of these carry an Auto Assembler or Lua script. Ferrite never runs \
+                 one — the text is here so you can read what the table would have done \
+                 and decide for yourself.",
+            );
+            return;
+        };
+        let Some(script) = entry.script_text.clone() else {
+            empty_state(
+                ui,
+                "No script on this entry",
+                "This one was skipped for the reason beside it, not because it carries \
+                 code.",
+            );
+            return;
+        };
+
+        let lines = script.lines().count();
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(&entry.description).color(theme::TEXT))
+                    .truncate(),
+            );
+            ui.label(
+                egui::RichText::new(format!("{lines} lines"))
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(theme::TEXT_DIM),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.checkbox(&mut self.script_wrap, "Wrap");
+                if ui.button("Copy").clicked() {
+                    ui.ctx().copy_text(script.clone());
+                }
+            });
+        });
+        ui.label(
+            egui::RichText::new(
+                "Read-only. Ferrite never assembles, injects or runs this — it is text \
+                 on a page.",
+            )
+            .font(theme::font(theme::text_style::SECONDARY))
+            .color(theme::TEXT_FAINT),
+        );
+        ui.add_space(theme::space::SM);
+
+        // A real read-only multiline field, not a painted block: selectable,
+        // copyable, and a single node in the accessibility tree.
+        egui::ScrollArea::both()
+            .id_salt("script_pane")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut text = script.as_str();
+                ui.add(
+                    egui::TextEdit::multiline(&mut text)
+                        .font(egui::TextStyle::Name(theme::text_style::MONO_VALUE.into()))
+                        .desired_width(if self.script_wrap {
+                            ui.available_width()
+                        } else {
+                            f32::INFINITY
+                        })
+                        .desired_rows(lines.clamp(8, 40))
+                        .interactive(true),
+                );
             });
     }
 
-    /// The saved-list panel: shows every saved entry with its live status,
-    /// independent of scan results and of attach state (see the vault's
-    /// `v1-plan.md`).
-    /// The saved list, as the dock's virtualised table.
-    ///
-    /// Four row states share one shape: an entry that can't resolve keeps
-    /// its address and its place in the list rather than being dropped or
-    /// hidden. That is the whole contract of a saved table — it outlives the
-    /// process it was made against.
     fn show_saved_list_table(&mut self, ui: &mut egui::Ui) {
         let mut to_remove: Option<usize> = None;
         // Split the borrows explicitly: the table body needs `&mut
@@ -2060,10 +2276,6 @@ impl FerriteApp {
 
     /// The central region once something is attached.
     fn show_results_region(&mut self, ui: &mut egui::Ui, window_width: f32) {
-        if self.import_report.is_some() {
-            self.show_import_report(ui);
-            ui.add_space(theme::space::LG);
-        }
         self.show_results_table(ui, window_width);
     }
 
@@ -2171,7 +2383,14 @@ impl eframe::App for FerriteApp {
         egui::CentralPanel::default()
             .frame(theme::panel(theme::GROUND))
             .show(ui, |ui| {
-                if self.attached.is_some() {
+                // The import report is its own view, not a banner above
+                // another one: importing a table while detached is a normal
+                // thing to do, and the report is the whole reason to look at
+                // the screen when it happens. Dismiss returns to whichever
+                // view the attach state calls for.
+                if self.import_report.is_some() {
+                    self.show_import_report(ui, window_width);
+                } else if self.attached.is_some() {
                     self.show_results_region(ui, window_width);
                 } else {
                     self.show_process_picker(ui);
