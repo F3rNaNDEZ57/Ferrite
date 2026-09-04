@@ -10,6 +10,89 @@ Pre-1.0, a minor version bump may carry a breaking change — see `0.2.0`.
 
 Nothing yet.
 
+## [1.1.0] — 2026-09-04
+
+[Release](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.1.0)
+
+**Ferrite can now run the data-only Lua scripts in a Cheat Engine table.**
+Nothing else changes: saved tables load unchanged, and every existing
+feature behaves as it did.
+
+### The important distinction
+
+"Run the Lua cheats in a `.CT` file" sounds like one feature. It is two,
+and only one of them is here.
+
+- A **`{$LUA}` script** runs *in Ferrite's own process* and acts on the
+  target through ordinary reads and writes — which is what Ferrite already
+  does for every scan. This release runs those.
+- An **Auto Assembler script** allocates memory *inside the target*, writes
+  machine code into it, and patches the target's execution to run that
+  code. Ferrite still does none of this, and it is still not planned.
+
+**Most god-mode cheats in downloaded tables are the second kind.** The
+import report now labels every script entry with which it is, so you can
+tell before trying.
+
+### Added
+
+- **`{$LUA}` script execution**, enabled and disabled per entry from the
+  import report. `[ENABLE]` and `[DISABLE]` work as they do in Cheat
+  Engine, and `[DISABLE]` runs automatically when you detach — a script
+  that changed values gets its restore path while there is still a process
+  to run it against.
+- **A data-only API**: `readInteger` / `writeInteger` and the rest of the
+  read, write, address-resolution and module functions, with Cheat
+  Engine's own signatures. An address argument may be a number or a
+  `module.exe+offset` string, as CE allows.
+- **Script classification** in the import report — data-only Lua, generates
+  code, Auto Assembler, no code, or unreadable — so an entry Ferrite can
+  run is visibly different from one it can only show you.
+- **A consent step.** No script runs on import, or without being agreed to
+  once per entry per session, with the script readable beside the prompt.
+
+### The sandbox, and its limits
+
+Scripts run in a Lua interpreter where the dangerous operations **do not
+exist**, rather than being inspected and judged safe. `io`, `os`,
+`package`, `require` and `debug` are never loaded; `load`, `loadstring`,
+`dofile` and `loadfile` are removed after construction, because they ship
+in Lua's base library and `dofile` reads and executes a file from disk.
+None of Cheat Engine's `autoAssemble`, `executeCode`, `allocateMemory`,
+`injectDLL` or debugger functions is provided, and there are no no-op
+stubs — a script reaching for one fails on a nil value rather than
+reporting success having done nothing.
+
+Runs are bounded three ways: 10 million VM instructions, 64 MB of Lua
+memory, and 2000 lines of retained output. The memory limit matters more
+than it sounds: `string.rep('x', 400000000)` is a *single* VM instruction,
+so the instruction budget cannot see it — measured allocating 400 MB in
+640 ms before the limit existed.
+
+**What the sandbox does not do:** a script can write to any address in the
+attached process. That is what a cheat *is*, so it cannot be designed
+away. "Sandboxed" here means it cannot reach your filesystem, your
+network, or the target's execution — it does not mean the script is
+harmless, which is why running one is a deliberate act.
+
+### Notes
+
+- **The security review of this release was self-conducted.** The intended
+  independent review pass could not be obtained. The sandbox was instead
+  tested adversarially — the memory limit above exists because that testing
+  found the hole — but that testing was done by the same author as the
+  design, which is the blind spot an independent reading exists to cover.
+  Weigh that accordingly before running scripts you did not write.
+- A failed enable that had already started reports as **partly applied**
+  rather than on or off, since neither would be true. Such an entry keeps a
+  "Run disable anyway" button.
+- Script state is per session, and scripts are not saved into Ferrite's own
+  table format — that format carries no executable content, so a script
+  there would be silently dropped on save.
+- `ferrite-core` gained `script`, `lua` and `lua_api` modules. It is
+  workspace-internal rather than a published crate, so this is not a
+  public API commitment.
+
 ## [1.0.0] — 2026-09-04
 
 [Release](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.0.0)
@@ -206,7 +289,8 @@ load a cheat table**.
 - Process-list icons, native file dialogs, a dark theme, and the
   application's own icon.
 
-[Unreleased]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.1.0...v0.2.0

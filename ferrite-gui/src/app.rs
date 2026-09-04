@@ -2826,9 +2826,13 @@ impl FerriteApp {
 
                 ui.add_space(theme::space::XL);
                 ui.label(
+                    // Narrowed at v1.1.0: a Lua script can now run, so a flat
+                    // "no code execution" would be false. What stayed true is
+                    // the part that matters — nothing is injected into or
+                    // executed *in the target*.
                     egui::RichText::new(
-                        "Reads and writes process data only. No code execution, no \
-                         network, no telemetry.",
+                        "Reads and writes process data only. No code injected into the \
+                         target, no network, no telemetry.",
                     )
                     .font(theme::font(theme::text_style::SECONDARY))
                     .color(theme::TEXT_FAINT),

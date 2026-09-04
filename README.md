@@ -12,7 +12,7 @@ by construction, and maintained in the open.
 
 ## Status
 
-**v1.0.0 is out.** The full core loop works and is verified against a real
+**v1.1.0 is out.** The full core loop works and is verified against a real
 target process: **attach → scan → filter (next scan) → edit / freeze →
 save & load a cheat table** (our own JSON format, plus importing existing
 Cheat Engine `.CT` tables).
@@ -37,11 +37,16 @@ Cheat Engine `.CT` tables).
 - Save/load your own cheat table as plain JSON, or import a real Cheat
   Engine `.CT` file. Multi-level pointer chains, string entries, `Pointer`
   and `Array of byte` entries all import properly, and `<ShowAsHex>` is
-  honoured. Entries Ferrite still can't represent — bit-fields, custom
-  Lua-converted types, script entries — are reported visibly, never
-  silently dropped or guessed at, and a skipped Auto Assembler / Lua entry
-  shows you its script text so you can read what it would have done before
-  deciding to trust it. Ferrite never executes it.
+  honoured. Entries Ferrite can't represent — bit-fields, custom
+  Lua-converted types — are reported visibly, never silently dropped or
+  guessed at.
+- **Data-only Lua scripts from a `.CT` file can be run**, enabled and
+  disabled per entry, in an interpreter where the functions that could
+  inject code or reach your filesystem or network do not exist. Nothing
+  runs without being read and agreed to first. **Auto Assembler scripts
+  are still never executed** — those allocate memory inside the target and
+  patch its execution, and Ferrite does neither. The import report labels
+  which kind each entry is, and shows you the script text either way.
 
 Known limitation: Windows-only, 64-bit targets only. See the Roadmap
 section for what's still deferred.
@@ -88,11 +93,13 @@ can't run. Still deferred, each needing its own design pass first:
   current AOB scan already does an unaligned substring search); it needs
   clarifying before it can be scoped.
 
-Explicitly *not* planned: running Lua / Auto Assembler scripts. That
-needs an embedded interpreter plus a large reimplementation of Cheat
-Engine's own Lua API — and, for plain Auto Assembler scripts, an x86-64
-assembler and code-injection machinery. Ferrite only ever touches data,
-never patches code or redirects execution.
+Explicitly *not* planned: running **Auto Assembler** scripts. Those
+allocate memory inside the target, assemble machine code into it, and
+patch the target's execution to run it — a fundamentally different
+capability from anything Ferrite does, and one that would retire the
+promise that it never injects or executes code in the process it is
+attached to. Data-only Lua scripts, which act only through ordinary reads
+and writes, have been runnable since v1.1.0.
 
 Full scope, architecture, and the decisions log live in the
 [wiki](https://github.com/F3rNaNDEZ57/Ferrite/wiki) — the project's

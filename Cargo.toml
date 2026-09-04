@@ -3,7 +3,7 @@ resolver = "2"
 members = ["ferrite-core", "ferrite-gui", "ferrite-victim"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 authors = ["F3rNaNDEZ57"]
 license = "MIT OR Apache-2.0"
