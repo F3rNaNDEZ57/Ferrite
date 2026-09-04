@@ -9,12 +9,13 @@ use eframe::egui;
 
 use crate::theme;
 use ferrite_core::{
-    AddressExpr, AobFilter, AobMatch, AttachError, CheatEntry, DEFAULT_FREEZE_INTERVAL, EntryValue,
-    FreezeHandle, ImportReport, ModuleMap, ProcessInfo, ProcessSession, ResolveError, ScanFilter,
-    ScanMatch, ScanOptions, ScanValue, ScriptKind, TextEncoding, decode_text, encode_text,
-    extract_icon_rgba, first_scan_aob, first_scan_exact, format_pattern, import_ct_file,
-    load_table, next_scan, next_scan_aob, parse_address_expr, parse_hex_pattern,
-    parse_pointer_offsets, resolve_address, save_table,
+    AddressExpr, AobFilter, AobMatch, AttachError, CheatEntry, DEFAULT_FREEZE_INTERVAL,
+    DEFAULT_INSTRUCTION_BUDGET, EntryValue, FreezeHandle, ImportReport, ModuleMap, ProcessInfo,
+    ProcessSession, ResolveError, ScanFilter, ScanMatch, ScanOptions, ScanValue, ScriptContext,
+    ScriptKind, Section, TextEncoding, decode_text, encode_text, extract_icon_rgba, first_scan_aob,
+    first_scan_exact, format_pattern, import_ct_file, load_table, next_scan, next_scan_aob,
+    parse_address_expr, parse_hex_pattern, parse_pointer_offsets, parse_script, resolve_address,
+    run_section, save_table,
 };
 
 /// How many result rows the table actually renders. Independent of
@@ -226,6 +227,43 @@ fn format_value(value: ScanValue) -> String {
     }
 }
 
+/// Whether a runnable script entry is currently applied.
+///
+/// Session state only. Script entries deliberately do **not** enter the
+/// saved list: Ferrite's own table format carries no executable content
+/// (see the vault's `v1.1-scope.md`), so a script in the saved list would
+/// be silently dropped by Save — a worse outcome than not offering it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScriptState {
+    Off,
+    On,
+    /// The enable path failed *after* it had started, so an unknown amount
+    /// of it took effect. Reported as its own state rather than collapsed
+    /// into on or off, because both of those would be a claim Ferrite
+    /// cannot support.
+    Suspect(String),
+}
+
+impl ScriptState {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Suspect(_) => "partly applied",
+        }
+    }
+
+    fn colour(&self) -> egui::Color32 {
+        match self {
+            Self::Off => theme::TEXT_DIM,
+            Self::On => theme::TEXT,
+            // The one place a script row uses the accent: a partly applied
+            // cheat is exactly the "something needs reading" case.
+            Self::Suspect(_) => theme::ACCENT_LIFT,
+        }
+    }
+}
+
 /// A scan's results are one kind or the other, never both — an `Option` of
 /// two parallel lists would let them disagree about which is current.
 enum Results {
@@ -354,6 +392,18 @@ pub struct FerriteApp {
     /// Whether the script pane soft-wraps. Off by default: assembly and Lua
     /// are line-oriented, and wrapping makes a long line look like two.
     script_wrap: bool,
+    /// State of each runnable script in the import report, keyed by its
+    /// index in `skipped`. Session-only — see [`ScriptState`].
+    script_state: HashMap<usize, ScriptState>,
+    /// Scripts the user has agreed to run this session, keyed the same way.
+    /// Consent is per entry and per session: it is not persisted, because a
+    /// table's contents can change between runs and a remembered yes would
+    /// then cover code nobody saw.
+    script_consent: HashSet<usize>,
+    /// The script whose consent is being asked for, if the prompt is open.
+    script_consent_prompt: Option<usize>,
+    /// Output and errors from the last script run, shown beside the script.
+    script_output: Vec<String>,
     /// When each address last changed, for the flash-on-change decay. Keyed
     /// by address, cleared with the results it belongs to.
     changed_at: HashMap<usize, f64>,
@@ -393,6 +443,10 @@ impl FerriteApp {
             manual_add_open: false,
             selected_skip: None,
             script_wrap: false,
+            script_state: HashMap::new(),
+            script_consent: HashSet::new(),
+            script_consent_prompt: None,
+            script_output: Vec::new(),
             changed_at: HashMap::new(),
         }
     }
@@ -549,6 +603,12 @@ impl FerriteApp {
         if attached.session.has_exited() {
             let message = format!("{} (pid {}) exited.", attached.process_name, attached.pid);
             self.process_exited_message = Some(message);
+            // No `[DISABLE]` here, deliberately: the process is already
+            // gone, so there is nothing to restore and running a disable
+            // path would only produce errors. The state is dropped instead —
+            // whatever a script did died with the process.
+            self.script_state.clear();
+            self.script_output.clear();
             self.attached = None; // Drop closes the handle and joins the freeze thread.
             self.mark_saved_entries_unattached();
             return;
@@ -1702,6 +1762,17 @@ impl FerriteApp {
             .filter(|s| s.script_text.is_some())
             .count();
         let was_active = report.was_active_in_source.len();
+        // A runnable script isn't "skipped" in the sense the rest of the
+        // summary means it - it can be enabled from here. Counting it as a
+        // skip would be the stale wording from before scripts could run.
+        // Computed here with the other counts, because everything below
+        // takes `self` mutably and the report borrow has to end first.
+        let runnable = report
+            .skipped
+            .iter()
+            .filter(|s| s.script_kind.is_some_and(|k| k.is_runnable()))
+            .count();
+        let unusable = skipped - runnable;
 
         ui.horizontal(|ui| {
             theme::section_label(ui, "import report");
@@ -1726,16 +1797,26 @@ impl FerriteApp {
         }
         ui.add_space(theme::space::XS);
 
-        let mut facts = vec![format!("{skipped} skipped")];
+        let mut facts = Vec::new();
+        if runnable > 0 {
+            facts.push(format!(
+                "{runnable} runnable script{}",
+                if runnable == 1 { "" } else { "s" }
+            ));
+        }
+        if unusable > 0 {
+            facts.push(format!("{unusable} couldn't be imported"));
+        }
+        let with_script = with_script.saturating_sub(runnable);
         if with_script > 0 {
-            facts.push(format!("{with_script} of them carry a script"));
+            facts.push(format!("{with_script} of those carry a script"));
         }
         if was_active > 0 {
             facts.push(format!("{was_active} were frozen in the source"));
         }
         ui.label(
             egui::RichText::new(format!(
-                "{}. Nothing was executed to produce this report.",
+                "{}. Nothing has been run — a script only runs when you say so.",
                 facts.join(" · ")
             ))
             .font(theme::font(theme::text_style::SECONDARY))
@@ -1780,6 +1861,261 @@ impl FerriteApp {
         }
     }
 
+    /// The context a script runs in: the attached session and the module
+    /// snapshot the rest of the interface resolves against, so a script and
+    /// the results table agree about where a module is.
+    fn script_context(&self) -> ScriptContext {
+        ScriptContext {
+            session: self.attached.as_ref().map(|a| Arc::clone(&a.session)),
+            modules: Arc::new(self.module_map.clone()),
+        }
+    }
+
+    /// Runs one half of a script entry and records what happened.
+    fn run_script(&mut self, index: usize, section: Section) {
+        let Some(report) = &self.import_report else {
+            return;
+        };
+        let Some(entry) = report.skipped.get(index) else {
+            return;
+        };
+        let Some(text) = entry.script_text.clone() else {
+            return;
+        };
+        let description = entry.description.clone();
+
+        let Ok(parsed) = parse_script(&text) else {
+            // The classifier already reported this; nothing to run.
+            return;
+        };
+
+        let ctx = self.script_context();
+        self.script_output.clear();
+        let result = run_section(&parsed, section, &ctx, false, DEFAULT_INSTRUCTION_BUDGET);
+
+        match result {
+            Ok(output) => {
+                self.script_output = output.printed;
+                if let Some(returned) = output.returned {
+                    // The interpreter's backstop fired: the script generated
+                    // assembly. Nothing was assembled, so this is suspect
+                    // rather than on.
+                    self.script_state.insert(
+                        index,
+                        ScriptState::Suspect(format!(
+                            "it produced assembly, which Ferrite cannot apply: {returned}"
+                        )),
+                    );
+                    return;
+                }
+                self.script_state.insert(
+                    index,
+                    match section {
+                        Section::Enable => ScriptState::On,
+                        Section::Disable => ScriptState::Off,
+                    },
+                );
+            }
+            Err(err) => {
+                self.script_output.push(format!("{description}: {err}"));
+                // The distinction that matters: a script that never started
+                // left the target untouched, so it stays off. One that
+                // failed after starting may have written some of what it
+                // intended, and claiming either state would be a claim
+                // Ferrite cannot support.
+                let state = if err.may_have_acted() {
+                    ScriptState::Suspect(err.to_string())
+                } else {
+                    match section {
+                        Section::Enable => ScriptState::Off,
+                        // A disable that never started leaves it applied.
+                        Section::Disable => ScriptState::On,
+                    }
+                };
+                self.script_state.insert(index, state);
+            }
+        }
+    }
+
+    /// Runs `[DISABLE]` for every script currently applied. Called on detach,
+    /// while there is still a process to run it against.
+    fn disable_all_scripts(&mut self) {
+        if self.attached.is_none() {
+            return;
+        }
+        let applied: Vec<usize> = self
+            .script_state
+            .iter()
+            .filter(|(_, state)| matches!(state, ScriptState::On))
+            .map(|(index, _)| *index)
+            .collect();
+        for index in applied {
+            self.run_script(index, Section::Disable);
+        }
+    }
+
+    /// Enable/disable for a runnable script, its current state, and
+    /// whatever the last run reported.
+    fn show_script_controls(&mut self, ui: &mut egui::Ui, index: usize) {
+        let state = self
+            .script_state
+            .get(&index)
+            .cloned()
+            .unwrap_or(ScriptState::Off);
+        let attached = self.attached.is_some();
+
+        ui.horizontal(|ui| {
+            // Nothing runs while detached: every read and write in the API
+            // raises without a process, so offering the button would only
+            // produce an error the user could have been spared.
+            ui.add_enabled_ui(attached, |ui| {
+                match state {
+                    ScriptState::On => {
+                        if ui.button("Disable").clicked() {
+                            self.run_script(index, Section::Disable);
+                        }
+                    }
+                    _ => {
+                        if theme::primary(ui, "Enable").clicked() {
+                            // Consent is asked once per entry per session;
+                            // after that, enabling is direct.
+                            if self.script_consent.contains(&index) {
+                                self.run_script(index, Section::Enable);
+                            } else {
+                                self.script_consent_prompt = Some(index);
+                            }
+                        }
+                    }
+                }
+                if matches!(state, ScriptState::Suspect(_))
+                    && ui.button("Run disable anyway").clicked()
+                {
+                    // The escape hatch for a partly applied script: the
+                    // disable half is the only thing that might undo it, and
+                    // refusing to offer it would leave the user stuck.
+                    self.run_script(index, Section::Disable);
+                }
+            });
+
+            ui.label(
+                egui::RichText::new(state.label())
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(state.colour()),
+            );
+            if !attached {
+                ui.label(
+                    egui::RichText::new("— attach a process first")
+                        .font(theme::font(theme::text_style::SECONDARY))
+                        .color(theme::TEXT_FAINT),
+                );
+            }
+        });
+
+        if let ScriptState::Suspect(detail) = &state {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "This script started and then failed, so some of what it intended \
+                         may have been applied and some not: {detail}"
+                    ))
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(theme::ACCENT_LIFT),
+                )
+                .wrap(),
+            );
+        }
+
+        if !self.script_output.is_empty() {
+            ui.add_space(theme::space::SM);
+            theme::section_label(ui, "script output");
+            for line in &self.script_output {
+                ui.label(
+                    egui::RichText::new(line)
+                        .font(theme::font(theme::text_style::MONO_VALUE))
+                        .color(theme::TEXT_DIM),
+                );
+            }
+        }
+    }
+
+    /// The consent prompt, shown before a script runs for the first time.
+    ///
+    /// Modal and explicit. A script is someone else's code, usually
+    /// downloaded, and the whole point of the report is that it can be read
+    /// first — so agreeing to run one is an act, not a checkbox buried in a
+    /// row.
+    fn show_script_consent(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.script_consent_prompt else {
+            return;
+        };
+        let Some(report) = &self.import_report else {
+            self.script_consent_prompt = None;
+            return;
+        };
+        let Some(entry) = report.skipped.get(index) else {
+            self.script_consent_prompt = None;
+            return;
+        };
+        let description = entry.description.clone();
+        let lines = entry
+            .script_text
+            .as_ref()
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+
+        let mut open = true;
+        let mut decision: Option<bool> = None;
+        egui::Window::new("Run this script?")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .frame(theme::panel(theme::SURFACE).stroke(theme::divider_stroke()))
+            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_width(496.0);
+                ui.label(
+                    egui::RichText::new(&description)
+                        .font(theme::font(theme::text_style::EMPTY_HEADLINE))
+                        .color(theme::TEXT),
+                );
+                ui.add_space(theme::space::SM);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "{lines} lines of Lua from this table will run, and it can read \
+                             and write this process's memory. It cannot inject code, reach \
+                             the filesystem or the network — those functions do not exist \
+                             in the interpreter. Read it on the right before deciding."
+                        ))
+                        .font(theme::font(theme::text_style::SECONDARY))
+                        .color(theme::TEXT_DIM),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(theme::space::MD);
+                ui.horizontal(|ui| {
+                    if theme::primary(ui, "Run it").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+
+        match decision {
+            Some(true) => {
+                self.script_consent.insert(index);
+                self.script_consent_prompt = None;
+                self.run_script(index, Section::Enable);
+            }
+            Some(false) => self.script_consent_prompt = None,
+            None if !open => self.script_consent_prompt = None,
+            None => {}
+        }
+    }
+
     /// The skipped entries, each with its reason.
     ///
     /// Not the virtualised table: a row carries a two-line reason, and
@@ -1809,6 +2145,14 @@ impl FerriteApp {
                         .as_ref()
                         .map(|s| s.lines().count())
                         .unwrap_or(0);
+                    // Only a runnable entry has a state at all.
+                    let runnable = entry.script_kind.is_some_and(|kind| kind.is_runnable());
+                    let state = runnable.then(|| {
+                        self.script_state
+                            .get(&index)
+                            .cloned()
+                            .unwrap_or(ScriptState::Off)
+                    });
 
                     let response = ui.allocate_ui(
                         egui::vec2(ui.available_width(), theme::REASON_ROW_HEIGHT),
@@ -1845,7 +2189,23 @@ impl FerriteApp {
                                         // an affordance.
                                         if lines > 0 {
                                             ui.add_space(theme::space::SM);
-                                            script_kind_chip(ui, entry.script_kind);
+                                            // A runnable entry shows what
+                                            // state it is in; everything
+                                            // else shows what kind it is,
+                                            // which is all there is to say
+                                            // about it.
+                                            match state.as_ref() {
+                                                Some(state) => {
+                                                    ui.label(
+                                                        egui::RichText::new(state.label())
+                                                            .font(theme::font(
+                                                                theme::text_style::SECONDARY,
+                                                            ))
+                                                            .color(state.colour()),
+                                                    );
+                                                }
+                                                None => script_kind_chip(ui, entry.script_kind),
+                                            }
                                             if ui
                                                 .selectable_label(
                                                     is_selected,
@@ -1884,9 +2244,9 @@ impl FerriteApp {
         let Some(report) = &self.import_report else {
             return;
         };
-        let Some(entry) = self
+        let Some((index, entry)) = self
             .selected_skip
-            .and_then(|index| report.skipped.get(index))
+            .and_then(|index| report.skipped.get(index).map(|entry| (index, entry)))
         else {
             // The count has to come from the report; an earlier draft
             // hardcoded "Nine", which was simply wrong for any other table.
@@ -1934,14 +2294,25 @@ impl FerriteApp {
                 }
             });
         });
+        // The copy narrows rather than disappearing: for an Auto Assembler
+        // entry it is still exactly true, and that is most of them.
+        let runnable = entry.script_kind.is_some_and(|kind| kind.is_runnable());
         ui.label(
-            egui::RichText::new(
+            egui::RichText::new(if runnable {
+                "Ferrite can run this one — it reads and writes memory, and cannot inject \
+                 code, reach the filesystem or the network."
+            } else {
                 "Read-only. Ferrite never assembles, injects or runs this — it is text \
-                 on a page.",
-            )
+                 on a page."
+            })
             .font(theme::font(theme::text_style::SECONDARY))
             .color(theme::TEXT_FAINT),
         );
+
+        if runnable {
+            ui.add_space(theme::space::SM);
+            self.show_script_controls(ui, index);
+        }
         ui.add_space(theme::space::SM);
 
         // A real read-only multiline field, not a painted block: selectable,
@@ -2369,7 +2740,14 @@ impl FerriteApp {
     }
 
     /// Detaches, dropping the handle and the freeze thread with it.
+    ///
+    /// Any script currently applied gets its `[DISABLE]` half run **first**,
+    /// while there is still a process to run it against. A script that
+    /// poked values expects that path, and after the handle is gone there is
+    /// no way to take it — so detaching without it would leave the target
+    /// modified with no route back.
     fn detach(&mut self) {
+        self.disable_all_scripts();
         self.attached = None;
         self.module_map = ModuleMap::empty();
         self.scan_region_summary = None;
@@ -2574,6 +2952,7 @@ impl eframe::App for FerriteApp {
             });
 
         self.show_manual_add_modal(ui.ctx());
+        self.show_script_consent(ui.ctx());
     }
 }
 

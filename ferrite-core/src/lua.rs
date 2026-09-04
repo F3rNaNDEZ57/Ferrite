@@ -85,8 +85,31 @@ pub enum LuaError {
     NotRunnable(ScriptKind),
     /// The instruction budget ran out — most likely an endless loop.
     BudgetExhausted { budget: u64 },
-    /// Lua itself failed: a syntax error, or an error raised at runtime.
-    Lua(String),
+    /// The script doesn't compile, so **nothing ran**.
+    ///
+    /// Separate from [`Self::Runtime`] because the difference is the whole
+    /// question a caller needs answered after a failed enable: a script that
+    /// never started leaves the target untouched, while one that failed
+    /// part-way through may have written some of what it intended. Only the
+    /// second needs reporting as suspect.
+    Syntax(String),
+    /// The script raised while running, so an unknown amount of it took
+    /// effect. See [`Self::Syntax`] for why this is a separate variant.
+    Runtime(String),
+}
+
+impl LuaError {
+    /// Whether the script may have partly taken effect before failing.
+    ///
+    /// `false` only when nothing can have run. Anything else is `true`,
+    /// including the budget case — a script stopped mid-loop has already
+    /// done whatever it did before the loop.
+    pub fn may_have_acted(&self) -> bool {
+        match self {
+            Self::NotRunnable(_) | Self::Syntax(_) => false,
+            Self::BudgetExhausted { .. } | Self::Runtime(_) => true,
+        }
+    }
 }
 
 impl std::fmt::Display for LuaError {
@@ -99,7 +122,7 @@ impl std::fmt::Display for LuaError {
                 f,
                 "the script was stopped after {budget} operations — it may not terminate"
             ),
-            Self::Lua(message) => write!(f, "{message}"),
+            Self::Syntax(message) | Self::Runtime(message) => write!(f, "{message}"),
         }
     }
 }
@@ -158,7 +181,7 @@ pub fn run_section(
         let lua = sandboxed(Arc::clone(&printed), budget)?;
         // The API goes in after the sandbox, so a name it installs can
         // never be one the sandbox was meant to have removed.
-        lua_api::install(&lua, ctx).map_err(|e| LuaError::Lua(e.to_string()))?;
+        lua_api::install(&lua, ctx).map_err(|e| LuaError::Runtime(e.to_string()))?;
 
         // Prepend exactly what Cheat Engine prepends. Real scripts refer to
         // these by name — `if syntaxcheck then return end` is the standard
@@ -194,14 +217,14 @@ fn sandboxed(printed: Arc<Mutex<Vec<String>>>, budget: u64) -> Result<Lua, LuaEr
         StdLib::STRING | StdLib::TABLE | StdLib::MATH,
         LuaOptions::default(),
     )
-    .map_err(|e| LuaError::Lua(e.to_string()))?;
+    .map_err(|e| LuaError::Runtime(e.to_string()))?;
 
     {
         let globals = lua.globals();
         for name in REMOVED_GLOBALS {
             globals
                 .set(*name, mlua::Nil)
-                .map_err(|e| LuaError::Lua(e.to_string()))?;
+                .map_err(|e| LuaError::Runtime(e.to_string()))?;
         }
 
         // `print` is replaced rather than removed: a script's output is
@@ -227,10 +250,10 @@ fn sandboxed(printed: Arc<Mutex<Vec<String>>>, budget: u64) -> Result<Lua, LuaEr
                     .push(line);
                 Ok(())
             })
-            .map_err(|e| LuaError::Lua(e.to_string()))?;
+            .map_err(|e| LuaError::Runtime(e.to_string()))?;
         globals
             .set("print", print)
-            .map_err(|e| LuaError::Lua(e.to_string()))?;
+            .map_err(|e| LuaError::Runtime(e.to_string()))?;
     }
 
     // The budget. The hook fires every HOOK_INTERVAL instructions and
@@ -252,7 +275,7 @@ fn sandboxed(printed: Arc<Mutex<Vec<String>>>, budget: u64) -> Result<Lua, LuaEr
             Ok(VmState::Continue)
         },
     )
-    .map_err(|e| LuaError::Lua(e.to_string()))?;
+    .map_err(|e| LuaError::Runtime(e.to_string()))?;
 
     Ok(lua)
 }
@@ -264,10 +287,14 @@ const BUDGET_MARKER: &str = "ferrite:instruction-budget-exhausted";
 fn classify_lua_error(err: &mlua::Error, budget: u64) -> LuaError {
     let text = err.to_string();
     if text.contains(BUDGET_MARKER) {
-        LuaError::BudgetExhausted { budget }
-    } else {
-        LuaError::Lua(text)
+        return LuaError::BudgetExhausted { budget };
     }
+    // A syntax error means the chunk never began executing, which is what
+    // lets a caller distinguish "nothing happened" from "something did".
+    if matches!(err, mlua::Error::SyntaxError { .. }) {
+        return LuaError::Syntax(text);
+    }
+    LuaError::Runtime(text)
 }
 
 #[cfg(test)]
@@ -376,8 +403,10 @@ mod tests {
         // their script loops when it actually threw.
         let err = run("{$lua}\nerror('deliberate')").expect_err("errors");
         match err {
-            LuaError::Lua(message) => assert!(message.contains("deliberate"), "got: {message}"),
-            other => panic!("expected a Lua error, got {other:?}"),
+            LuaError::Runtime(message) => {
+                assert!(message.contains("deliberate"), "got: {message}")
+            }
+            other => panic!("expected a runtime error, got {other:?}"),
         }
     }
 
@@ -487,6 +516,42 @@ mod tests {
             DEFAULT_INSTRUCTION_BUDGET,
         );
         assert_eq!(result, Err(LuaError::NotRunnable(ScriptKind::Assembler)));
+    }
+
+    #[test]
+    fn a_syntax_error_is_told_apart_from_a_runtime_one() {
+        // The distinction the GUI needs after a failed enable: a script that
+        // never compiled left the target untouched, while one that raised
+        // part-way through may have written some of what it intended.
+        let broken = run("{$lua}\nthis is not lua at all").expect_err("fails");
+        assert!(
+            matches!(broken, LuaError::Syntax(_)),
+            "expected a syntax error, got {broken:?}"
+        );
+        assert!(!broken.may_have_acted(), "nothing can have run");
+
+        let raised = run("{$lua}\nprint('acted')\nerror('then failed')").expect_err("fails");
+        assert!(
+            matches!(raised, LuaError::Runtime(_)),
+            "expected a runtime error, got {raised:?}"
+        );
+        assert!(raised.may_have_acted(), "the print already happened");
+
+        // The budget counts as having acted too - a script stopped mid-loop
+        // has already done whatever preceded the loop.
+        let script = parse_script("{$lua}\nwhile true do end").expect("parses");
+        let stopped = run_section(
+            &script,
+            Section::Enable,
+            &ScriptContext::detached(),
+            false,
+            100_000,
+        )
+        .expect_err("fails");
+        assert!(stopped.may_have_acted());
+
+        // ...and a refusal did not, by definition.
+        assert!(!LuaError::NotRunnable(ScriptKind::Assembler).may_have_acted());
     }
 
     #[test]
