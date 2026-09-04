@@ -67,6 +67,25 @@ pub const REMOVED_GLOBALS: &[&str] = &[
 /// needs and still terminates in well under a second.
 pub const DEFAULT_INSTRUCTION_BUDGET: u64 = 10_000_000;
 
+/// How much memory a single script run may allocate inside Lua.
+///
+/// The instruction budget cannot see an allocation: `string.rep('x', 4e8)`
+/// is *one* VM instruction, and was measured taking 400 MB in 640 ms before
+/// this limit existed. A cheat-table script manipulates numbers and short
+/// strings, so 64 MB is generous — and an exhausted allocator surfaces as
+/// an ordinary Lua error the script can even catch, rather than as a
+/// process the user has to kill.
+pub const DEFAULT_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
+
+/// How many lines of `print` output a single run may retain.
+///
+/// This buffer lives in Rust, outside Lua's own accounting, so the memory
+/// budget above does not cover it — a flooding loop would grow it until
+/// something else failed. Past the cap, output is dropped and the caller is
+/// told, which is better than keeping a hundred thousand lines nobody can
+/// read.
+pub const MAX_PRINTED_LINES: usize = 2_000;
+
 /// How often the budget is checked, in VM instructions. Checking every
 /// instruction would dominate the runtime; every few thousand is
 /// indistinguishable in wall-clock terms for a runaway loop.
@@ -136,6 +155,11 @@ pub struct RunOutput {
     /// own output is often how it tells the user what it did, and Ferrite
     /// has no console to send it to.
     pub printed: Vec<String>,
+    /// Whether `print` output was dropped because the run produced more
+    /// than [`MAX_PRINTED_LINES`]. Reported rather than silently truncated:
+    /// a script whose output just stops is indistinguishable from one that
+    /// stopped running.
+    pub output_truncated: bool,
     /// The string a block returned, if it returned one.
     ///
     /// Cheat Engine would substitute this into the script as assembly. This
@@ -193,9 +217,13 @@ pub fn run_section(
             .set_name("cheat table script")
             .call::<Option<String>>((syntax_check, mlua::Nil));
 
-        output
-            .printed
-            .append(&mut printed.lock().expect("print buffer isn't poisoned"));
+        {
+            let mut buffer = printed.lock().expect("print buffer isn't poisoned");
+            if buffer.len() >= MAX_PRINTED_LINES {
+                output.output_truncated = true;
+            }
+            output.printed.append(&mut buffer);
+        }
 
         match result {
             Ok(None) => {}
@@ -218,6 +246,11 @@ fn sandboxed(printed: Arc<Mutex<Vec<String>>>, budget: u64) -> Result<Lua, LuaEr
         LuaOptions::default(),
     )
     .map_err(|e| LuaError::Runtime(e.to_string()))?;
+
+    // Bounds what the instruction budget cannot see. Set before any script
+    // code runs, so there is no window in which an allocation is unbounded.
+    lua.set_memory_limit(DEFAULT_MEMORY_BUDGET)
+        .map_err(|e| LuaError::Runtime(e.to_string()))?;
 
     {
         let globals = lua.globals();
@@ -244,10 +277,13 @@ fn sandboxed(printed: Arc<Mutex<Vec<String>>>, budget: u64) -> Result<Lua, LuaEr
                     })
                     .collect::<Vec<_>>()
                     .join("\t");
-                printed
-                    .lock()
-                    .expect("print buffer isn't poisoned")
-                    .push(line);
+                let mut buffer = printed.lock().expect("print buffer isn't poisoned");
+                // Past the cap the line is dropped rather than retained.
+                // The buffer is Rust-side, so Lua's memory limit does not
+                // bound it.
+                if buffer.len() < MAX_PRINTED_LINES {
+                    buffer.push(line);
+                }
                 Ok(())
             })
             .map_err(|e| LuaError::Runtime(e.to_string()))?;
@@ -395,6 +431,41 @@ mod tests {
             Err(LuaError::BudgetExhausted { budget: 100_000 }),
             "an endless loop must terminate"
         );
+    }
+
+    #[test]
+    fn a_single_allocation_cannot_exhaust_memory() {
+        // The instruction budget cannot see this: `string.rep` allocates in
+        // one VM instruction. Measured at 400 MB in 640 ms before the
+        // memory limit existed, which is a denial of service from one line
+        // of someone else's script.
+        let err = run("{$lua}\nlocal s = string.rep('x', 400000000); print(#s)")
+            .expect_err("should be refused");
+        assert!(
+            matches!(err, LuaError::Runtime(_)),
+            "expected a runtime error, got {err:?}"
+        );
+
+        // ...while an ordinary string is untouched.
+        let out = run("{$lua}\nprint(#string.rep('x', 1000))").expect("runs");
+        assert_eq!(out.printed, vec!["1000".to_string()]);
+    }
+
+    #[test]
+    fn print_output_is_capped_and_the_truncation_is_reported() {
+        // The buffer is Rust-side, so Lua's memory limit does not bound it.
+        // Silent truncation would be worse than the cap: output that just
+        // stops looks like a script that stopped running.
+        let out = run(&format!(
+            "{{$lua}}\nfor i = 1, {} do print('line') end",
+            MAX_PRINTED_LINES + 500
+        ))
+        .expect("runs");
+        assert_eq!(out.printed.len(), MAX_PRINTED_LINES);
+        assert!(out.output_truncated, "truncation must be reported");
+
+        let out = run("{$lua}\nprint('one')").expect("runs");
+        assert!(!out.output_truncated);
     }
 
     #[test]

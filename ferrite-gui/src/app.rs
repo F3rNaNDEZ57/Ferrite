@@ -1896,6 +1896,14 @@ impl FerriteApp {
         match result {
             Ok(output) => {
                 self.script_output = output.printed;
+                if output.output_truncated {
+                    // Said plainly, because output that merely stops looks
+                    // like a script that stopped running.
+                    self.script_output.push(
+                        "… further output was dropped: this script printed more than                          Ferrite keeps."
+                            .to_string(),
+                    );
+                }
                 if let Some(returned) = output.returned {
                     // The interpreter's backstop fired: the script generated
                     // assembly. Nothing was assembled, so this is suspect

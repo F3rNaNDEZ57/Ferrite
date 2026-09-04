@@ -30,7 +30,10 @@ pub use aob::{
 pub use ct_import::{CtImportError, ImportReport, SkippedEntry, import_ct_file, import_ct_xml};
 pub use freeze::{DEFAULT_FREEZE_INTERVAL, FreezeHandle};
 pub use icon::{IconRgba, extract_icon_rgba};
-pub use lua::{DEFAULT_INSTRUCTION_BUDGET, LuaError, REMOVED_GLOBALS, RunOutput, run_section};
+pub use lua::{
+    DEFAULT_INSTRUCTION_BUDGET, DEFAULT_MEMORY_BUDGET, LuaError, MAX_PRINTED_LINES,
+    REMOVED_GLOBALS, RunOutput, run_section,
+};
 pub use lua_api::ScriptContext;
 pub use modules::{ModuleError, ModuleInfo, ModuleMap, ModuleOffset, list_modules, module_base};
 pub use pointer::{MAX_POINTER_CHAIN_DEPTH, resolve_pointer, resolve_pointer_chain};
