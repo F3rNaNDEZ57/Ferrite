@@ -22,8 +22,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 700.0])
-            .with_min_inner_size([700.0, 500.0])
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([1024.0, 700.0])
             .with_icon(icon),
         ..Default::default()
     };
@@ -38,6 +38,10 @@ fn main() -> eframe::Result {
             creation_context
                 .egui_ctx
                 .set_theme(eframe::egui::ThemePreference::Dark);
+            // Fonts before style: the style names font families
+            // (`archivo-extrabold` and the rest), and egui panics on a
+            // family nothing is bound to.
+            creation_context.egui_ctx.set_fonts(theme::fonts());
             creation_context
                 .egui_ctx
                 .set_style_of(eframe::egui::Theme::Dark, theme::style());

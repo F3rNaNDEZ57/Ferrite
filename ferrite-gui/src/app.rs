@@ -537,14 +537,14 @@ impl FerriteApp {
         });
 
         if let Some(err) = &self.attach_error {
-            ui.colored_label(theme::ERROR, err);
+            ui.colored_label(theme::ACCENT_LIFT, err);
         }
         if let Some(msg) = &self.process_exited_message {
-            ui.colored_label(theme::ERROR, msg);
+            ui.colored_label(theme::ACCENT_LIFT, msg);
         }
 
         if self.attached.is_none() {
-            theme::card().show(ui, |ui| {
+            theme::panel(theme::SURFACE).show(ui, |ui| {
                 if ui.button("Refresh process list").clicked() {
                     self.processes = sorted_processes();
                 }
@@ -601,7 +601,7 @@ impl FerriteApp {
             return;
         };
 
-        theme::card().show(ui, |ui| {
+        theme::panel(theme::SURFACE).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Type:");
                 let previous_type = self.value_type;
@@ -672,7 +672,7 @@ impl FerriteApp {
             });
 
             if let Some(err) = &self.input_error {
-                ui.colored_label(theme::ERROR, err);
+                ui.colored_label(theme::ACCENT_LIFT, err);
             }
 
             let is_aob_results = matches!(attached.results, Some(Results::Aob(_)));
@@ -745,7 +745,7 @@ impl FerriteApp {
 
         let mut to_promote: Option<SavedRow> = None;
 
-        theme::card().show(ui, |ui| {
+        theme::panel(theme::SURFACE).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("New value:");
                 ui.text_edit_singleline(&mut self.edit_input_text);
@@ -778,7 +778,7 @@ impl FerriteApp {
                 ui.label(format!("({selected_count} selected)"));
             });
             if let Some(err) = &self.edit_input_error {
-                ui.colored_label(theme::ERROR, err);
+                ui.colored_label(theme::ACCENT_LIFT, err);
             }
 
             let Attached {
@@ -950,7 +950,7 @@ impl FerriteApp {
                     }
                 });
                 if let Some(err) = &self.manual_add_error {
-                    ui.colored_label(theme::ERROR, err);
+                    ui.colored_label(theme::ACCENT_LIFT, err);
                 }
             });
     }
@@ -979,7 +979,7 @@ impl FerriteApp {
     /// native file dialog for v1 (a decided simplification, see the vault's
     /// `v1-plan.md`).
     fn show_persistence_controls(&mut self, ui: &mut egui::Ui) {
-        theme::card().show(ui, |ui| {
+        theme::panel(theme::SURFACE).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Table file:");
                 let path_text = if self.table_path_text.is_empty() {
@@ -1100,7 +1100,7 @@ impl FerriteApp {
                             // on purpose, not to bury the reasons for every
                             // other skipped entry under a wall of text.
                             ui.vertical(|ui| {
-                                ui.colored_label(theme::ERROR, &skipped.reason);
+                                ui.colored_label(theme::ACCENT_LIFT, &skipped.reason);
                                 if let Some(script) = &skipped.script_text {
                                     egui::CollapsingHeader::new("Show script")
                                         .id_salt(("import_script", &skipped.description))
@@ -1134,7 +1134,7 @@ impl FerriteApp {
 
         let mut to_remove: Option<usize> = None;
 
-        theme::card().show(ui, |ui| {
+        theme::panel(theme::SURFACE).show(ui, |ui| {
             ui.heading("Saved list");
 
             let freeze_handle = self.attached.as_ref().map(|a| &a.freeze);
