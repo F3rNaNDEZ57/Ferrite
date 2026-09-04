@@ -10,8 +10,8 @@ use eframe::egui;
 use crate::theme;
 use ferrite_core::{
     AddressExpr, AobFilter, AobMatch, AttachError, CheatEntry, DEFAULT_FREEZE_INTERVAL, EntryValue,
-    FreezeHandle, ImportReport, ProcessInfo, ProcessSession, ResolveError, ScanFilter, ScanMatch,
-    ScanOptions, ScanValue, TextEncoding, decode_text, encode_text, extract_icon_rgba,
+    FreezeHandle, ImportReport, ModuleMap, ProcessInfo, ProcessSession, ResolveError, ScanFilter,
+    ScanMatch, ScanOptions, ScanValue, TextEncoding, decode_text, encode_text, extract_icon_rgba,
     first_scan_aob, first_scan_exact, format_pattern, import_ct_file, load_table, next_scan,
     next_scan_aob, parse_address_expr, parse_hex_pattern, parse_pointer_offsets, resolve_address,
     save_table,
@@ -122,6 +122,23 @@ impl ValueTypeChoice {
                 zero_terminated: false,
             },
             None => EntryValue::Bytes(bytes),
+        }
+    }
+
+    /// The helper line under the value field: what this type accepts. It
+    /// occupies the message slot whenever there is no error to show, so the
+    /// slot is never empty space that only fills up when something breaks.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::I8 => "Decimal. Signed 8-bit.",
+            Self::I16 => "Decimal. Signed 16-bit.",
+            Self::I32 => "Decimal. Signed 32-bit.",
+            Self::I64 => "Decimal. Signed 64-bit.",
+            Self::F32 => "Decimal, with a fractional part. 32-bit float.",
+            Self::F64 => "Decimal, with a fractional part. 64-bit float.",
+            Self::Aob => "Hex bytes, whitespace optional.",
+            Self::Text => "Text, one byte per character.",
+            Self::UnicodeText => "Text, two bytes per character (UTF-16).",
         }
     }
 
@@ -298,6 +315,25 @@ pub struct FerriteApp {
     /// (first time a path is drawn) and never cleared - an exe's icon
     /// doesn't change mid-session.
     icon_cache: HashMap<PathBuf, Option<egui::TextureHandle>>,
+    /// Free-text filter over the process list — name, PID and path.
+    process_filter: String,
+    /// Hide targets Ferrite can't attach to, on by default: an unattachable
+    /// row is noise until you're looking for it.
+    hide_32_bit: bool,
+    /// A snapshot of the target's modules, for showing a result's address as
+    /// `module+offset`. Rebuilt on attach and on each first scan, never per
+    /// row — see [`ferrite_core::ModuleMap`].
+    module_map: ModuleMap,
+    /// Committed writable bytes and region count in the attached target,
+    /// shown in the rail so a scan's scope is visible before it runs.
+    scan_region_summary: Option<(u64, usize)>,
+    /// Match counts, one per scan in the current chain: `18402 → 412 → 6`.
+    scan_history: Vec<usize>,
+    /// Whether the manual-add modal is open.
+    manual_add_open: bool,
+    /// When each address last changed, for the flash-on-change decay. Keyed
+    /// by address, cleared with the results it belongs to.
+    changed_at: HashMap<usize, f64>,
 }
 
 impl FerriteApp {
@@ -326,6 +362,13 @@ impl FerriteApp {
             table_status: None,
             import_report: None,
             icon_cache: HashMap::new(),
+            process_filter: String::new(),
+            hide_32_bit: true,
+            module_map: ModuleMap::empty(),
+            scan_region_summary: None,
+            scan_history: Vec::new(),
+            manual_add_open: false,
+            changed_at: HashMap::new(),
         }
     }
 
@@ -344,6 +387,18 @@ impl FerriteApp {
                     selected: HashSet::new(),
                     last_refresh: Instant::now(),
                 });
+
+                // Both are snapshots taken once per attach rather than per
+                // frame: the module map answers a per-row question on a
+                // 100 ms tick, and the region summary walks the whole
+                // address space.
+                if let Some(attached) = &self.attached {
+                    self.module_map =
+                        ModuleMap::build(&attached.session).unwrap_or_else(|_| ModuleMap::empty());
+                    let regions = attached.session.writable_regions();
+                    self.scan_region_summary =
+                        Some((regions.iter().map(|r| r.size as u64).sum(), regions.len()));
+                }
                 self.attach_error = None;
                 self.process_exited_message = None;
             }
@@ -457,7 +512,7 @@ impl FerriteApp {
     /// already touches the session on a timer regardless of freeze state,
     /// so it's the natural place to close that gap with one extra cheap
     /// call - see the "Known scope limit" note in the vault's `v1-plan.md`.
-    fn refresh_live_values(&mut self) {
+    fn refresh_live_values(&mut self, now: f64) {
         let Some(attached) = &mut self.attached else {
             return;
         };
@@ -480,18 +535,28 @@ impl FerriteApp {
         let Some(results) = results else {
             return;
         };
+        let changed_at = &mut self.changed_at;
 
         match results {
             Results::Numeric(matches) => {
                 for m in matches.iter_mut().take(MAX_RENDERED_ROWS) {
                     if let Ok(bytes) = session.read_bytes(m.address, m.value.size()) {
-                        m.value = m.value.from_le_bytes_like(&bytes);
+                        let fresh = m.value.from_le_bytes_like(&bytes);
+                        // Note *when* it changed, not that it did: the row
+                        // flashes and decays from this timestamp.
+                        if fresh != m.value {
+                            changed_at.insert(m.address, now);
+                        }
+                        m.value = fresh;
                     }
                 }
             }
             Results::Aob(matches) => {
                 for m in matches.iter_mut().take(MAX_RENDERED_ROWS) {
                     if let Ok(bytes) = session.read_bytes(m.address, m.bytes.len()) {
+                        if bytes != m.bytes {
+                            changed_at.insert(m.address, now);
+                        }
                         m.bytes = bytes;
                     }
                 }
@@ -521,386 +586,788 @@ impl FerriteApp {
             .clone()
     }
 
+    /// The process picker, which is the whole central region until
+    /// something is attached.
+    ///
+    /// A filter and an architecture column, because the two things that make
+    /// this list hard are that it is several hundred rows long and that a
+    /// third of it can't be attached to at all.
     fn show_process_picker(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Ferrite");
-            if let Some(attached) = &self.attached {
-                ui.label(format!(
-                    "— attached to {} (pid {})",
-                    attached.process_name, attached.pid
-                ));
-                if ui.button("Detach").clicked() {
-                    self.attached = None; // Drop closes the handle.
-                    self.mark_saved_entries_unattached();
-                }
-            }
-        });
-
         if let Some(err) = &self.attach_error {
-            ui.colored_label(theme::ACCENT_LIFT, err);
+            ui.label(
+                egui::RichText::new(err)
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(theme::ACCENT_LIFT),
+            );
+            ui.add_space(theme::space::SM);
         }
         if let Some(msg) = &self.process_exited_message {
-            ui.colored_label(theme::ACCENT_LIFT, msg);
+            ui.label(
+                egui::RichText::new(msg)
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(theme::ACCENT_LIFT),
+            );
+            ui.add_space(theme::space::SM);
         }
 
-        if self.attached.is_none() {
-            theme::panel(theme::SURFACE).show(ui, |ui| {
-                if ui.button("Refresh process list").clicked() {
-                    self.processes = sorted_processes();
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [260.0, theme::FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut self.process_filter)
+                    .hint_text("Filter by name, PID or path"),
+            );
+            ui.checkbox(&mut self.hide_32_bit, "Hide 32-bit");
+            if ui.button("Refresh").clicked() {
+                self.processes = sorted_processes();
+            }
+        });
+        ui.add_space(theme::space::SM);
+
+        let needle = self.process_filter.trim().to_lowercase();
+        let visible: Vec<ProcessInfo> = self
+            .processes
+            .iter()
+            .filter(|p| {
+                if self.hide_32_bit && !p.arch.is_attachable() {
+                    return false;
                 }
+                if needle.is_empty() {
+                    return true;
+                }
+                p.name.to_lowercase().contains(&needle)
+                    || p.pid.to_string().contains(&needle)
+                    || p.exe
+                        .as_ref()
+                        .is_some_and(|e| e.to_string_lossy().to_lowercase().contains(&needle))
+            })
+            .cloned()
+            .collect();
 
-                let ctx = ui.ctx().clone();
-                egui::ScrollArea::vertical()
-                    .id_salt("process_list_scroll")
-                    .max_height(300.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("process_list")
-                            .striped(true)
-                            .num_columns(4)
-                            .show(ui, |ui| {
-                                ui.strong("");
-                                ui.strong("PID");
-                                ui.strong("Name");
-                                ui.end_row();
+        let hidden_32 = self
+            .processes
+            .iter()
+            .filter(|p| !p.arch.is_attachable())
+            .count();
+        let mut summary = format!("{} of {} processes", visible.len(), self.processes.len());
+        if !needle.is_empty() {
+            summary.push_str(&format!(" matching \"{}\"", self.process_filter.trim()));
+        }
+        if self.hide_32_bit && hidden_32 > 0 {
+            summary.push_str(&format!(" · {hidden_32} hidden as 32-bit"));
+        }
+        ui.label(
+            egui::RichText::new(summary)
+                .font(theme::font(theme::text_style::SECONDARY))
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(theme::space::SM);
 
-                                // Clone the list up front: attaching inside
-                                // the loop would otherwise borrow
-                                // self.processes while also needing &mut
-                                // self to attach.
-                                for process in self.processes.clone() {
-                                    let icon = process
-                                        .exe
-                                        .as_deref()
-                                        .and_then(|path| self.icon_texture(&ctx, path));
-                                    match icon {
-                                        Some(texture) => {
-                                            ui.add(
-                                                egui::Image::new(&texture)
-                                                    .fit_to_exact_size(egui::vec2(16.0, 16.0)),
-                                            );
-                                        }
-                                        None => {
-                                            ui.allocate_space(egui::vec2(16.0, 16.0));
-                                        }
-                                    }
-                                    ui.label(process.pid.to_string());
-                                    ui.label(&process.name);
-                                    if ui.button("Attach").clicked() {
-                                        self.attach(&process);
-                                    }
-                                    ui.end_row();
-                                }
-                            });
+        let mut to_attach: Option<ProcessInfo> = None;
+        let ctx = ui.ctx().clone();
+        let mut icons: Vec<Option<egui::TextureHandle>> = Vec::with_capacity(visible.len());
+        for process in &visible {
+            icons.push(
+                process
+                    .exe
+                    .as_deref()
+                    .and_then(|path| self.icon_texture(&ctx, path)),
+            );
+        }
+
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("process_table")
+            .striped(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::exact(24.0))
+            .column(egui_extras::Column::exact(72.0))
+            .column(egui_extras::Column::exact(220.0))
+            .column(egui_extras::Column::remainder())
+            .column(egui_extras::Column::exact(56.0))
+            .column(egui_extras::Column::exact(96.0))
+            .header(theme::HEADER_HEIGHT, |mut header| {
+                header.col(|ui| {
+                    theme::column_header(ui, "");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "pid");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "name");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "path");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "arch");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "");
+                });
+            })
+            .body(|body| {
+                body.rows(theme::ROW_HEIGHT, visible.len(), |mut row| {
+                    let index = row.index();
+                    let process = &visible[index];
+                    let attachable = process.arch.is_attachable();
+
+                    row.col(|ui| {
+                        match &icons[index] {
+                            Some(texture) => {
+                                ui.add(
+                                    egui::Image::new(texture)
+                                        .fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                                );
+                            }
+                            None => {
+                                ui.allocate_space(egui::vec2(16.0, 16.0));
+                            }
+                        };
                     });
+                    row.col(|ui| {
+                        ui.label(
+                            egui::RichText::new(process.pid.to_string())
+                                .font(theme::font(theme::text_style::MONO_VALUE))
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&process.name).color(
+                                if attachable {
+                                    theme::TEXT
+                                } else {
+                                    theme::TEXT_FAINT
+                                },
+                            ))
+                            .truncate(),
+                        );
+                    });
+                    row.col(|ui| {
+                        let path = process
+                            .exe
+                            .as_ref()
+                            .map(|e| e.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&path)
+                                    .font(theme::font(theme::text_style::SECONDARY))
+                                    .color(theme::TEXT_FAINT),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(path);
+                    });
+                    row.col(|ui| {
+                        ui.label(
+                            egui::RichText::new(process.arch.label())
+                                .font(theme::font(theme::text_style::MONO_VALUE))
+                                .color(if attachable {
+                                    theme::TEXT_DIM
+                                } else {
+                                    theme::ACCENT_LIFT
+                                }),
+                        );
+                    });
+                    row.col(|ui| {
+                        if attachable {
+                            if ui.button("Attach").clicked() {
+                                to_attach = Some(process.clone());
+                            }
+                        } else {
+                            // Named rather than merely disabled: the reason
+                            // is the useful part, and it is a property of
+                            // Ferrite, not of the process.
+                            ui.label(
+                                egui::RichText::new("64-bit only")
+                                    .font(theme::font(theme::text_style::SECONDARY))
+                                    .color(theme::TEXT_FAINT),
+                            );
+                        }
+                    });
+                });
             });
+
+        if let Some(process) = to_attach {
+            self.attach(&process);
         }
     }
 
-    fn show_scan_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(attached) = &mut self.attached else {
-            return;
-        };
+    /// The SCAN group: what to look for, and the button that starts it.
+    fn show_scan_group(&mut self, ui: &mut egui::Ui) {
+        let attached = self.attached.is_some();
+        ui.horizontal(|ui| {
+            theme::section_label(ui, "scan");
+            if !attached {
+                ui.label(
+                    egui::RichText::new("available once attached")
+                        .font(theme::font(theme::text_style::SECONDARY))
+                        .color(theme::TEXT_FAINT),
+                );
+            }
+        });
+        ui.add_space(theme::space::SM);
 
-        theme::panel(theme::SURFACE).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Type:");
-                let previous_type = self.value_type;
-                egui::ComboBox::new("value_type", "")
-                    .selected_text(self.value_type.label())
-                    .show_ui(ui, |ui| {
-                        for choice in ValueTypeChoice::ALL {
-                            ui.selectable_value(&mut self.value_type, choice, choice.label());
-                        }
-                    });
-                if self.value_type != previous_type {
-                    // Switching types mid-session invalidates the current
-                    // results (a filter for one kind is meaningless applied
-                    // to the other) - clear rather than let them go stale,
-                    // and drop selections along with them (frozen entries
-                    // are left alone - they're independent of what's
-                    // currently shown).
-                    attached.results = None;
-                    attached.capped = false;
-                    attached.selected.clear();
-                }
-
-                let scans_as_bytes = self.value_type.scans_as_bytes();
-                ui.label(match self.value_type.text_encoding() {
-                    Some(_) => "Text:",
-                    None if scans_as_bytes => "Pattern:",
-                    None => "Value:",
-                });
-                ui.text_edit_singleline(&mut self.input_text);
-
-                if ui.button("First Scan").clicked() {
-                    if scans_as_bytes {
-                        match self.value_type.parse_pattern(&self.input_text) {
-                            Ok(pattern) => {
-                                let result = first_scan_aob(
-                                    &attached.session,
-                                    &pattern,
-                                    ScanOptions::default(),
-                                );
-                                attached.capped = result.capped;
-                                attached.results = Some(Results::Aob(result.matches));
-                                self.input_error = None;
-                            }
-                            Err(err) => self.input_error = Some(err),
-                        }
-                    } else {
-                        match self.value_type.parse(&self.input_text) {
-                            Ok(target) => {
-                                let result = first_scan_exact(
-                                    &attached.session,
-                                    target,
-                                    ScanOptions::default(),
-                                );
-                                attached.capped = result.capped;
-                                attached.results = Some(Results::Numeric(result.matches));
-                                self.input_error = None;
-                            }
-                            Err(err) => self.input_error = Some(err),
-                        }
+        // Rendered inactive rather than hidden while detached: the controls
+        // are the explanation of what this program does.
+        ui.add_enabled_ui(attached, |ui| {
+            ui.label(
+                egui::RichText::new("Value type")
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(theme::TEXT_DIM),
+            );
+            let previous_type = self.value_type;
+            egui::ComboBox::new("value_type", "")
+                .selected_text(self.value_type.label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for choice in ValueTypeChoice::ALL {
+                        ui.selectable_value(&mut self.value_type, choice, choice.label());
                     }
-                }
+                });
+            if self.value_type != previous_type
+                && let Some(attached) = &mut self.attached
+            {
+                // A filter for one kind of result is meaningless applied to
+                // the other, so switching type clears them rather than
+                // leaving them to be misread.
+                attached.results = None;
+                attached.capped = false;
+                attached.selected.clear();
+                self.scan_history.clear();
+                self.changed_at.clear();
+                self.input_error = None;
+            }
 
-                if attached.results.is_some() && ui.button("New Scan").clicked() {
-                    attached.results = None;
-                    attached.capped = false;
-                    attached.selected.clear();
+            ui.add_space(theme::space::SM);
+            ui.label(
+                egui::RichText::new(match self.value_type.text_encoding() {
+                    Some(_) => "Text",
+                    None if self.value_type.scans_as_bytes() => "Pattern",
+                    None => "Value",
+                })
+                .font(theme::font(theme::text_style::SECONDARY))
+                .color(theme::TEXT_DIM),
+            );
+            ui.add_sized(
+                [ui.available_width(), theme::FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut self.input_text)
+                    .font(egui::TextStyle::Name(theme::text_style::MONO_VALUE.into())),
+            );
+            // Validated as you type, not on submit. First Scan is disabled
+            // while the field doesn't parse, so a submit-time error would
+            // never be reachable — the slot has to carry the reason instead.
+            let live_error = self.scan_input_error();
+            message_slot(
+                ui,
+                live_error.as_deref().or(self.input_error.as_deref()),
+                self.value_type.hint(),
+            );
+
+            ui.horizontal(|ui| {
+                // Inactive until the field parses, so an invalid scan is
+                // impossible rather than merely reported afterwards.
+                let parses = self.scan_input_parses();
+                if ui
+                    .add_enabled_ui(parses, |ui| theme::primary(ui, "First Scan"))
+                    .inner
+                    .clicked()
+                {
+                    self.run_first_scan();
+                }
+                if self.attached.as_ref().is_some_and(|a| a.results.is_some())
+                    && ui.button("New Scan").clicked()
+                {
+                    if let Some(attached) = &mut self.attached {
+                        attached.results = None;
+                        attached.capped = false;
+                        attached.selected.clear();
+                    }
+                    self.scan_history.clear();
+                    self.changed_at.clear();
                 }
             });
-
-            if let Some(err) = &self.input_error {
-                ui.colored_label(theme::ACCENT_LIFT, err);
-            }
-
-            let is_aob_results = matches!(attached.results, Some(Results::Aob(_)));
-            if attached.results.is_some() {
-                ui.horizontal(|ui| {
-                    ui.label("Next scan filter:");
-                    if is_aob_results {
-                        egui::ComboBox::new("scan_filter", "")
-                            .selected_text(aob_filter_label(self.aob_filter))
-                            .show_ui(ui, |ui| {
-                                for filter in [AobFilter::Changed, AobFilter::Unchanged] {
-                                    ui.selectable_value(
-                                        &mut self.aob_filter,
-                                        filter,
-                                        aob_filter_label(filter),
-                                    );
-                                }
-                            });
-                    } else {
-                        egui::ComboBox::new("scan_filter", "")
-                            .selected_text(filter_label(self.filter))
-                            .show_ui(ui, |ui| {
-                                for filter in [
-                                    ScanFilter::Changed,
-                                    ScanFilter::Unchanged,
-                                    ScanFilter::Increased,
-                                    ScanFilter::Decreased,
-                                ] {
-                                    ui.selectable_value(
-                                        &mut self.filter,
-                                        filter,
-                                        filter_label(filter),
-                                    );
-                                }
-                            });
-                    }
-
-                    if ui.button("Next Scan").clicked() {
-                        match &attached.results {
-                            Some(Results::Numeric(matches)) => {
-                                let updated = next_scan(&attached.session, matches, self.filter);
-                                attached.results = Some(Results::Numeric(updated));
-                            }
-                            Some(Results::Aob(matches)) => {
-                                let updated =
-                                    next_scan_aob(&attached.session, matches, self.aob_filter);
-                                attached.results = Some(Results::Aob(updated));
-                            }
-                            None => {}
-                        }
-                        attached.capped = false; // next_scan only narrows, never re-caps
-                    }
-                });
-            }
         });
     }
 
-    fn show_results_table(&mut self, ui: &mut egui::Ui) {
-        // How byte matches are displayed and promoted depends on which type
-        // produced them, and `AobMatch` doesn't carry that. Reading it from
-        // the scan panel is safe because switching types clears the results
-        // it would otherwise be misapplied to.
-        let value_type = self.value_type;
+    /// Why the scan field's contents can't be scanned, or `None` if they
+    /// can. An empty field is not an error — it is the starting state, and
+    /// shouting at someone who hasn't typed anything yet is noise.
+    fn scan_input_error(&self) -> Option<String> {
+        if self.input_text.trim().is_empty() {
+            return None;
+        }
+        if self.value_type.scans_as_bytes() {
+            match self.value_type.parse_pattern(&self.input_text) {
+                Ok(p) if p.is_empty() => Some("Enter at least one byte.".to_string()),
+                Ok(_) => None,
+                Err(err) => Some(err),
+            }
+        } else {
+            self.value_type.parse(&self.input_text).err()
+        }
+    }
+
+    /// Whether the scan field currently holds something scannable. Drives the
+    /// disabled state of First Scan, and is the same parse the scan itself
+    /// performs.
+    fn scan_input_parses(&self) -> bool {
+        if self.value_type.scans_as_bytes() {
+            self.value_type
+                .parse_pattern(&self.input_text)
+                .is_ok_and(|p| !p.is_empty())
+        } else {
+            self.value_type.parse(&self.input_text).is_ok()
+        }
+    }
+
+    /// Runs a first scan with whatever the field holds.
+    fn run_first_scan(&mut self) {
         let Some(attached) = &mut self.attached else {
             return;
         };
-        if attached.results.is_none() {
-            return;
+        if self.value_type.scans_as_bytes() {
+            match self.value_type.parse_pattern(&self.input_text) {
+                Ok(pattern) => {
+                    let result =
+                        first_scan_aob(&attached.session, &pattern, ScanOptions::default());
+                    attached.capped = result.capped;
+                    self.scan_history = vec![result.matches.len()];
+                    attached.results = Some(Results::Aob(result.matches));
+                    self.input_error = None;
+                }
+                Err(err) => self.input_error = Some(err),
+            }
+        } else {
+            match self.value_type.parse(&self.input_text) {
+                Ok(target) => {
+                    let result =
+                        first_scan_exact(&attached.session, target, ScanOptions::default());
+                    attached.capped = result.capped;
+                    self.scan_history = vec![result.matches.len()];
+                    attached.results = Some(Results::Numeric(result.matches));
+                    self.input_error = None;
+                }
+                Err(err) => self.input_error = Some(err),
+            }
+        }
+        self.changed_at.clear();
+        // The module map is a snapshot; a fresh scan is the natural moment to
+        // retake it, since that is when new addresses appear.
+        if let Some(attached) = &self.attached {
+            self.module_map =
+                ModuleMap::build(&attached.session).unwrap_or_else(|_| ModuleMap::empty());
+        }
+    }
+
+    /// The RESCAN group. Absent rather than greyed while there are no
+    /// results: it has nothing to filter.
+    fn show_rescan_group(&mut self, ui: &mut egui::Ui) {
+        theme::section_label(ui, "rescan");
+        ui.add_space(theme::space::SM);
+
+        let is_aob = matches!(
+            self.attached.as_ref().and_then(|a| a.results.as_ref()),
+            Some(Results::Aob(_))
+        );
+        ui.horizontal_wrapped(|ui| {
+            if is_aob {
+                for filter in [AobFilter::Changed, AobFilter::Unchanged] {
+                    ui.selectable_value(&mut self.aob_filter, filter, aob_filter_label(filter));
+                }
+            } else {
+                for filter in [
+                    ScanFilter::Changed,
+                    ScanFilter::Unchanged,
+                    ScanFilter::Increased,
+                    ScanFilter::Decreased,
+                ] {
+                    ui.selectable_value(&mut self.filter, filter, filter_label(filter));
+                }
+            }
+        });
+        ui.add_space(theme::space::SM);
+
+        if theme::primary(ui, "Next Scan").clicked() {
+            let (filter, aob_filter) = (self.filter, self.aob_filter);
+            if let Some(attached) = &mut self.attached {
+                match &attached.results {
+                    Some(Results::Numeric(matches)) => {
+                        let updated = next_scan(&attached.session, matches, filter);
+                        self.scan_history.push(updated.len());
+                        attached.results = Some(Results::Numeric(updated));
+                    }
+                    Some(Results::Aob(matches)) => {
+                        let updated = next_scan_aob(&attached.session, matches, aob_filter);
+                        self.scan_history.push(updated.len());
+                        attached.results = Some(Results::Aob(updated));
+                    }
+                    None => {}
+                }
+                attached.capped = false; // next_scan only narrows, never re-caps
+            }
         }
 
+        if self.scan_history.len() > 1 {
+            ui.add_space(theme::space::SM);
+            let chain = self
+                .scan_history
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(" → ");
+            ui.label(
+                egui::RichText::new(chain)
+                    .font(theme::font(theme::text_style::MONO_VALUE))
+                    .color(theme::TEXT_DIM),
+            );
+        }
+    }
+
+    /// The WRITE group: what to set the selected addresses to.
+    fn show_write_group(&mut self, ui: &mut egui::Ui) {
+        let selected = self
+            .attached
+            .as_ref()
+            .map(|a| a.selected.len())
+            .unwrap_or(0);
+        ui.horizontal(|ui| {
+            theme::section_label(ui, "write");
+            ui.label(
+                egui::RichText::new(format!("— {selected} selected"))
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(theme::TEXT_DIM),
+            );
+        });
+        ui.add_space(theme::space::SM);
+
+        ui.add_enabled_ui(selected > 0, |ui| {
+            ui.add_sized(
+                [ui.available_width(), theme::FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut self.edit_input_text)
+                    .font(egui::TextStyle::Name(theme::text_style::MONO_VALUE.into())),
+            );
+            message_slot(ui, self.edit_input_error.as_deref(), "");
+            ui.horizontal(|ui| {
+                if theme::primary(ui, "Set value").clicked() {
+                    self.write_selected();
+                }
+                if ui.button("Freeze selected").clicked() {
+                    self.freeze_selected();
+                }
+            });
+        });
+    }
+
+    /// Writes the edit field's value to every selected address.
+    fn write_selected(&mut self) {
+        match parse_write_bytes(self.value_type, &self.edit_input_text) {
+            Ok(bytes) => {
+                if let Some(attached) = &mut self.attached {
+                    for &address in &attached.selected {
+                        // One address failing to write shouldn't stop the
+                        // rest of the batch.
+                        let _ = attached.session.write_bytes(address, &bytes);
+                        // A frozen address's pin has to move too, or the
+                        // freeze thread reverts this write on its next tick.
+                        if attached.freeze.is_frozen(address) {
+                            attached.freeze.freeze(address, bytes.clone());
+                        }
+                    }
+                }
+                self.edit_input_error = None;
+            }
+            Err(err) => self.edit_input_error = Some(err),
+        }
+    }
+
+    /// Freezes every selected address at whatever it currently holds.
+    fn freeze_selected(&mut self) {
+        let Some(attached) = &mut self.attached else {
+            return;
+        };
+        let addresses: Vec<usize> = attached.selected.iter().copied().collect();
+        for address in addresses {
+            let size = match &attached.results {
+                Some(Results::Numeric(m)) => m
+                    .iter()
+                    .find(|m| m.address == address)
+                    .map(|m| m.value.size()),
+                Some(Results::Aob(m)) => m
+                    .iter()
+                    .find(|m| m.address == address)
+                    .map(|m| m.bytes.len()),
+                None => None,
+            };
+            if let Some(size) = size
+                && let Ok(bytes) = attached.session.read_bytes(address, size)
+            {
+                attached.freeze.freeze(address, bytes);
+            }
+        }
+    }
+
+    /// The central results region: a summary line, then one virtualised
+    /// table.
+    ///
+    /// Every visible row re-reads target memory on a 100 ms tick, and a scan
+    /// can return tens of thousands of addresses, so only the rows actually
+    /// on screen are built at all — `TableBuilder::rows` gives the callback a
+    /// row index and nothing else is touched.
+    fn show_results_table(&mut self, ui: &mut egui::Ui, window_width: f32) {
+        let Some(attached) = &mut self.attached else {
+            return;
+        };
+        let Some(results) = &attached.results else {
+            empty_state(
+                ui,
+                "Attached. No scan yet.",
+                "Type the value you can see in the target — health, ammo, a score — then \
+                 run a first scan. Change it, come back, and narrow the results down.",
+            );
+            return;
+        };
+
+        let total = match results {
+            Results::Numeric(m) => m.len(),
+            Results::Aob(m) => m.len(),
+        };
+        let capped = attached.capped;
+        let selected_count = attached.selected.len();
+        let frozen_count = match results {
+            Results::Numeric(m) => m
+                .iter()
+                .filter(|m| attached.freeze.is_frozen(m.address))
+                .count(),
+            Results::Aob(m) => m
+                .iter()
+                .filter(|m| attached.freeze.is_frozen(m.address))
+                .count(),
+        };
+
+        // Which optional columns fit. A dropped column's content moves to the
+        // row tooltip rather than being lost.
+        let show_module = window_width >= theme::breakpoint::DROP_MODULE;
+        let show_previous = window_width >= theme::breakpoint::DROP_PREVIOUS;
+
+        ui.horizontal(|ui| {
+            theme::section_label(ui, "results");
+            ui.add_space(theme::space::SM);
+            ui.label(
+                egui::RichText::new(format!("{total} addresses"))
+                    .font(theme::font(theme::text_style::MONO_LIVE))
+                    .color(theme::TEXT),
+            );
+            let mut note = Vec::new();
+            if capped {
+                note.push("capped — narrow your search".to_string());
+            }
+            if selected_count > 0 {
+                note.push(format!("{selected_count} selected"));
+            }
+            if frozen_count > 0 {
+                note.push(format!("{frozen_count} frozen"));
+            }
+            if !note.is_empty() {
+                ui.label(
+                    egui::RichText::new(note.join(" · "))
+                        .font(theme::font(theme::text_style::SECONDARY))
+                        .color(if capped {
+                            theme::ACCENT_LIFT
+                        } else {
+                            theme::TEXT_DIM
+                        }),
+                );
+            }
+        });
+        ui.add_space(theme::space::SM);
+
+        let value_type = self.value_type;
+        let module_map = &self.module_map;
+        let changed_at = &self.changed_at;
+        let now = ui.input(|i| i.time);
         let mut to_promote: Option<SavedRow> = None;
 
-        theme::panel(theme::SURFACE).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("New value:");
-                ui.text_edit_singleline(&mut self.edit_input_text);
+        let Attached {
+            freeze,
+            selected,
+            results,
+            ..
+        } = attached;
+        let results = results.as_ref().expect("checked above");
 
-                let selected_count = attached.selected.len();
-                let set_clicked = ui
-                    .add_enabled(selected_count > 0, egui::Button::new("Set Value"))
-                    .clicked();
-                if set_clicked {
-                    match parse_write_bytes(self.value_type, &self.edit_input_text) {
-                        Ok(bytes) => {
-                            for &address in &attached.selected {
-                                // A single address failing to write (e.g. the
-                                // page became unwritable) shouldn't stop the
-                                // rest of the batch.
-                                let _ = attached.session.write_bytes(address, &bytes);
-                                // A frozen address' target must move too, or
-                                // the freeze thread overwrites this write with
-                                // the old pinned bytes on its very next tick -
-                                // a silent revert the user has no way to see.
-                                if attached.freeze.is_frozen(address) {
-                                    attached.freeze.freeze(address, bytes.clone());
-                                }
-                            }
-                            self.edit_input_error = None;
+        let mut builder = egui_extras::TableBuilder::new(ui)
+            .id_salt("results_table")
+            .striped(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(egui_extras::Column::exact(theme::col::SELECT))
+            .column(egui_extras::Column::exact(theme::col::FREEZE))
+            .column(egui_extras::Column::exact(theme::col::ADDRESS))
+            .column(egui_extras::Column::exact(theme::col::VALUE));
+        if show_previous {
+            builder = builder.column(egui_extras::Column::exact(theme::col::VALUE));
+        }
+        if show_module {
+            builder = builder.column(egui_extras::Column::remainder());
+        }
+        builder = builder.column(egui_extras::Column::exact(theme::col::ACTION));
+
+        builder
+            .header(theme::HEADER_HEIGHT, |mut header| {
+                header.col(|ui| {
+                    theme::column_header(ui, "");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "frz");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "address");
+                });
+                header.col(|ui| {
+                    theme::column_header(ui, "value");
+                });
+                if show_previous {
+                    header.col(|ui| {
+                        theme::column_header(ui, "previous");
+                    });
+                }
+                if show_module {
+                    header.col(|ui| {
+                        theme::column_header(ui, "module + offset");
+                    });
+                }
+                header.col(|ui| {
+                    theme::column_header(ui, "");
+                });
+            })
+            .body(|body| {
+                body.rows(theme::ROW_HEIGHT, total, |mut row| {
+                    let index = row.index();
+                    let (address, value_text, previous_text, live_bytes) = match results {
+                        Results::Numeric(m) => {
+                            let m = &m[index];
+                            (
+                                m.address,
+                                format_value(m.value),
+                                format_value(m.previous),
+                                m.value.to_le_bytes(),
+                            )
                         }
-                        Err(err) => self.edit_input_error = Some(err),
+                        Results::Aob(m) => {
+                            let m = &m[index];
+                            (
+                                m.address,
+                                value_type.format_bytes(&m.bytes),
+                                value_type.format_bytes(&m.previous),
+                                m.bytes.clone(),
+                            )
+                        }
+                    };
+                    let is_selected = selected.contains(&address);
+                    row.set_selected(is_selected);
+
+                    row.col(|ui| {
+                        let mut checked = is_selected;
+                        if ui.checkbox(&mut checked, "").changed() {
+                            if checked {
+                                selected.insert(address);
+                            } else {
+                                selected.remove(&address);
+                            }
+                        }
+                    });
+                    row.col(|ui| {
+                        let mut frozen = freeze.is_frozen(address);
+                        if ui.checkbox(&mut frozen, "").changed() {
+                            if frozen {
+                                freeze.freeze(address, live_bytes.clone());
+                            } else {
+                                freeze.unfreeze(address);
+                            }
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.add(egui::Label::new(hex_address_job(address, is_selected)).extend());
+                    });
+                    row.col(|ui| {
+                        // A value that changed on the last tick flashes and
+                        // decays back to the row ground, so a change is
+                        // visible even if you were looking elsewhere.
+                        let flash = changed_at
+                            .get(&address)
+                            .map(|t| ((now - t) / theme::FLASH_DECAY as f64).clamp(0.0, 1.0))
+                            .unwrap_or(1.0);
+                        if flash < 1.0 {
+                            let rect = ui.max_rect();
+                            ui.painter().rect_filled(
+                                rect,
+                                0.0,
+                                theme::ACCENT_WASH.gamma_multiply(1.0 - flash as f32),
+                            );
+                        }
+                        ui.label(
+                            egui::RichText::new(value_text)
+                                .font(theme::font(theme::text_style::MONO_LIVE))
+                                .color(theme::TEXT),
+                        );
+                    });
+                    if show_previous {
+                        row.col(|ui| {
+                            ui.label(
+                                egui::RichText::new(previous_text)
+                                    .font(theme::font(theme::text_style::MONO_VALUE))
+                                    .color(theme::TEXT_DIM),
+                            );
+                        });
                     }
-                }
-                ui.label(format!("({selected_count} selected)"));
+                    if show_module {
+                        row.col(|ui| {
+                            let text = module_map
+                                .resolve(address)
+                                .map(|m| m.to_string())
+                                .unwrap_or_else(|| "—".to_string());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(text)
+                                        .font(theme::font(theme::text_style::MONO_VALUE))
+                                        .color(theme::TEXT_DIM),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    }
+                    row.col(|ui| {
+                        if ui
+                            .add(egui::Button::new("→").frame(false))
+                            .on_hover_text("Send to the saved list")
+                            .clicked()
+                        {
+                            to_promote = Some(SavedRow {
+                                entry: CheatEntry {
+                                    description: format!("{address:X}"),
+                                    base: AddressExpr::Absolute(address),
+                                    pointer_offsets: Vec::new(),
+                                    value: match results {
+                                        Results::Numeric(m) => EntryValue::Scalar(m[index].value),
+                                        Results::Aob(m) => value_type
+                                            .entry_value_from_bytes(m[index].bytes.clone()),
+                                    },
+                                    frozen: false,
+                                    show_as_hex: false,
+                                },
+                                resolved_address: Some(address),
+                                status: RowStatus::Resolved,
+                            });
+                        }
+                    });
+                });
             });
-            if let Some(err) = &self.edit_input_error {
-                ui.colored_label(theme::ACCENT_LIFT, err);
-            }
-
-            let Attached {
-                freeze,
-                results,
-                selected,
-                capped,
-                ..
-            } = attached;
-            let Some(results) = results else {
-                return;
-            };
-
-            match results {
-                Results::Numeric(matches) => {
-                    let shown = render_result_summary(ui, matches.len(), *capped);
-                    egui::ScrollArea::vertical()
-                        .id_salt("results_table_scroll")
-                        .show(ui, |ui| {
-                            egui::Grid::new("results_table")
-                                .striped(true)
-                                .num_columns(5)
-                                .show(ui, |ui| {
-                                    ui.strong("");
-                                    ui.strong("Frozen");
-                                    ui.strong("Address");
-                                    ui.strong("Value");
-                                    ui.strong("");
-                                    ui.end_row();
-
-                                    for m in matches.iter().take(shown) {
-                                        show_selection_checkbox(ui, selected, m.address);
-                                        show_frozen_checkbox(ui, freeze, m.address, || {
-                                            m.value.to_le_bytes()
-                                        });
-                                        ui.label(format!("{:#x}", m.address));
-                                        ui.label(format_value(m.value));
-                                        if ui.button("Add to saved list").clicked() {
-                                            to_promote = Some(SavedRow {
-                                                entry: CheatEntry {
-                                                    description: format!(
-                                                        "{} @ {:#x}",
-                                                        format_value(m.value),
-                                                        m.address
-                                                    ),
-                                                    base: AddressExpr::Absolute(m.address),
-                                                    pointer_offsets: Vec::new(),
-                                                    value: EntryValue::Scalar(m.value),
-                                                    frozen: false,
-                                                    show_as_hex: false,
-                                                },
-                                                resolved_address: Some(m.address),
-                                                status: RowStatus::Resolved,
-                                            });
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                }
-                Results::Aob(matches) => {
-                    let shown = render_result_summary(ui, matches.len(), *capped);
-                    egui::ScrollArea::vertical()
-                        .id_salt("results_table_scroll")
-                        .show(ui, |ui| {
-                            egui::Grid::new("results_table")
-                                .striped(true)
-                                .num_columns(5)
-                                .show(ui, |ui| {
-                                    ui.strong("");
-                                    ui.strong("Frozen");
-                                    ui.strong("Address");
-                                    ui.strong(match value_type.text_encoding() {
-                                        Some(_) => "Text",
-                                        None => "Bytes",
-                                    });
-                                    ui.strong("");
-                                    ui.end_row();
-
-                                    for m in matches.iter().take(shown) {
-                                        show_selection_checkbox(ui, selected, m.address);
-                                        show_frozen_checkbox(ui, freeze, m.address, || {
-                                            m.bytes.clone()
-                                        });
-                                        ui.label(format!("{:#x}", m.address));
-                                        ui.label(value_type.format_bytes(&m.bytes));
-                                        if ui.button("Add to saved list").clicked() {
-                                            to_promote = Some(SavedRow {
-                                                entry: CheatEntry {
-                                                    description: format!(
-                                                        "{} @ {:#x}",
-                                                        value_type.format_bytes(&m.bytes),
-                                                        m.address
-                                                    ),
-                                                    base: AddressExpr::Absolute(m.address),
-                                                    pointer_offsets: Vec::new(),
-                                                    value: value_type
-                                                        .entry_value_from_bytes(m.bytes.clone()),
-                                                    frozen: false,
-                                                    show_as_hex: false,
-                                                },
-                                                resolved_address: Some(m.address),
-                                                status: RowStatus::Resolved,
-                                            });
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                }
-            }
-        });
 
         if let Some(row) = to_promote {
             self.saved.push(row);
         }
     }
 
-    /// Manual "add address" form — works regardless of attach state (the
-    /// row simply shows `NotAttached` until a matching process is attached
-    /// and the next refresh tick resolves it). See the vault's
-    /// `v1-plan.md`.
     fn show_manual_add_form(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Add address manually")
             .default_open(false)
@@ -978,55 +1445,18 @@ impl FerriteApp {
     /// Save/load controls: a plain path text field plus two buttons - no
     /// native file dialog for v1 (a decided simplification, see the vault's
     /// `v1-plan.md`).
-    fn show_persistence_controls(&mut self, ui: &mut egui::Ui) {
-        theme::panel(theme::SURFACE).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Table file:");
-                let path_text = if self.table_path_text.is_empty() {
-                    "(none selected)"
-                } else {
-                    &self.table_path_text
-                };
-                ui.weak(path_text);
+    /// The table actions in the top bar. Labels drop to icons on a narrow
+    /// window, but the process identity and Detach always stay in words.
+    ///
+    /// Declared Import, Load, Save because the top bar lays this group out
+    /// right-to-left, which renders them Save, Load, Import from the left.
+    fn show_table_actions(&mut self, ui: &mut egui::Ui, icons_only: bool) {
+        {
+            {
+                let label =
+                    |full: &str, icon: &str| if icons_only { icon } else { full }.to_string();
 
-                if ui.button("Save…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("cheat_table.json")
-                        .add_filter("Ferrite table", &["json"])
-                        .save_file()
-                {
-                    let entries: Vec<CheatEntry> =
-                        self.saved.iter().map(|r| r.entry.clone()).collect();
-                    match save_table(&path, &entries) {
-                        Ok(()) => {
-                            self.table_status = Some(format!("Saved {} entries.", entries.len()));
-                            self.table_path_text = path.display().to_string();
-                        }
-                        Err(err) => self.table_status = Some(format!("Save failed: {err}")),
-                    }
-                }
-                if ui.button("Load…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Ferrite table", &["json"])
-                        .pick_file()
-                {
-                    match load_table(&path) {
-                        Ok(entries) => {
-                            self.table_status = Some(format!("Loaded {} entries.", entries.len()));
-                            self.table_path_text = path.display().to_string();
-                            self.saved = entries
-                                .into_iter()
-                                .map(|entry| SavedRow {
-                                    entry,
-                                    resolved_address: None,
-                                    status: RowStatus::NotAttached,
-                                })
-                                .collect();
-                        }
-                        Err(err) => self.table_status = Some(format!("Load failed: {err}")),
-                    }
-                }
-                if ui.button("Import .CT…").clicked()
+                if ui.button(label("Import .CT", ".CT")).clicked()
                     && let Some(path) = rfd::FileDialog::new()
                         .add_filter("Cheat Engine table", &["CT", "ct"])
                         .pick_file()
@@ -1051,12 +1481,45 @@ impl FerriteApp {
                         Err(err) => self.table_status = Some(format!("Import failed: {err}")),
                     }
                 }
-            });
-            if let Some(status) = &self.table_status {
-                ui.label(status);
+                if ui.button(label("Load table", "↑")).clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Ferrite table", &["json"])
+                        .pick_file()
+                {
+                    match load_table(&path) {
+                        Ok(entries) => {
+                            self.table_status = Some(format!("Loaded {} entries.", entries.len()));
+                            self.table_path_text = path.display().to_string();
+                            self.saved = entries
+                                .into_iter()
+                                .map(|entry| SavedRow {
+                                    entry,
+                                    resolved_address: None,
+                                    status: RowStatus::NotAttached,
+                                })
+                                .collect();
+                        }
+                        Err(err) => self.table_status = Some(format!("Load failed: {err}")),
+                    }
+                }
+                if ui.button(label("Save table", "↓")).clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_file_name("cheat_table.json")
+                        .add_filter("Ferrite table", &["json"])
+                        .save_file()
+                {
+                    let entries: Vec<CheatEntry> =
+                        self.saved.iter().map(|r| r.entry.clone()).collect();
+                    match save_table(&path, &entries) {
+                        Ok(()) => {
+                            self.table_status = Some(format!("Saved {} entries.", entries.len()));
+                            self.table_path_text = path.display().to_string();
+                        }
+                        Err(err) => self.table_status = Some(format!("Save failed: {err}")),
+                    }
+                }
             }
-            self.show_import_report(ui);
-        });
+        }
     }
 
     /// The visible unsupported-entries report `.CT` import must show, per
@@ -1200,38 +1663,6 @@ impl FerriteApp {
     }
 }
 
-/// Renders the leftmost "select this row" checkbox and keeps `selected` in
-/// sync with it.
-fn show_selection_checkbox(ui: &mut egui::Ui, selected: &mut HashSet<usize>, address: usize) {
-    let mut is_selected = selected.contains(&address);
-    if ui.checkbox(&mut is_selected, "").changed() {
-        if is_selected {
-            selected.insert(address);
-        } else {
-            selected.remove(&address);
-        }
-    }
-}
-
-/// Renders the "Frozen" checkbox and toggles the freeze thread's entry for
-/// `address` to match. `current_bytes` is called only when the checkbox is
-/// freshly checked - freezing pins whatever the row is currently showing.
-fn show_frozen_checkbox(
-    ui: &mut egui::Ui,
-    freeze: &FreezeHandle,
-    address: usize,
-    current_bytes: impl FnOnce() -> Vec<u8>,
-) {
-    let mut is_frozen = freeze.is_frozen(address);
-    if ui.checkbox(&mut is_frozen, "").changed() {
-        if is_frozen {
-            freeze.freeze(address, current_bytes());
-        } else {
-            freeze.unfreeze(address);
-        }
-    }
-}
-
 /// Renders a saved-list row's "Frozen" checkbox. Unlike
 /// `show_frozen_checkbox` (results-table rows, which have no persisted
 /// frozen flag of their own), this also keeps `row.entry.frozen` in sync so
@@ -1282,19 +1713,124 @@ fn parse_entry_value(value_type: ValueTypeChoice, text: &str) -> Result<EntryVal
     }
 }
 
-/// Renders the "N result(s) [capped / showing first M]" summary line shared
-/// by both results kinds, and returns how many rows the caller should
-/// actually render.
-fn render_result_summary(ui: &mut egui::Ui, total: usize, capped: bool) -> usize {
-    let shown = total.min(MAX_RENDERED_ROWS);
-    let mut summary = format!("{total} result(s)");
-    if capped {
-        summary.push_str(" (scan stopped early — too many matches; narrow your search)");
-    } else if total > shown {
-        summary.push_str(&format!(" — showing first {shown}"));
+/// A byte count at a scale that stays readable: a small target reported as
+/// "0.00 GB" tells the user nothing, so the unit follows the magnitude.
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.0} KB", b / KB)
     }
-    ui.label(summary);
-    shown
+}
+
+/// An empty state: a headline and one sentence telling the user what to do
+/// next. Inset from the region's edges so it reads as deliberate space
+/// rather than as a region that failed to fill.
+fn empty_state(ui: &mut egui::Ui, headline: &str, body: &str) {
+    ui.add_space(theme::space::XXL);
+    ui.horizontal(|ui| {
+        ui.add_space(theme::space::XXL);
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new(headline)
+                    .font(theme::font(theme::text_style::EMPTY_HEADLINE))
+                    .color(theme::TEXT),
+            );
+            ui.add_space(theme::space::SM);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(body)
+                        .font(theme::font(theme::text_style::SECONDARY))
+                        .color(theme::TEXT_DIM),
+                )
+                .wrap(),
+            );
+        });
+    });
+}
+
+/// A fixed-height slot beneath a fallible field, holding either an error or
+/// the field's hint.
+///
+/// Allocated whether or not there is a message, which is the whole point: an
+/// error appearing must not move everything below it. Two lines' worth, and
+/// a longer message ellipsises rather than growing the slot.
+fn message_slot(ui: &mut egui::Ui, error: Option<&str>, hint: &str) {
+    let (text, color) = match error {
+        Some(err) => (err, theme::ACCENT_LIFT),
+        None => (hint, theme::TEXT_FAINT),
+    };
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), theme::MESSAGE_SLOT_HEIGHT),
+        egui::Sense::hover(),
+    );
+    if text.is_empty() {
+        return;
+    }
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    child.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .font(theme::font(theme::text_style::SECONDARY))
+                .color(color),
+        )
+        .truncate(),
+    );
+}
+
+/// Renders a 64-bit address as a fixed-width 16-digit hex run, with the
+/// leading zeros dimmed.
+///
+/// This is what makes a column of addresses line up. Printed with `{:#x}`,
+/// `0x14a20` and `0x7ff6a41c58da` are different widths and read as ragged
+/// text rather than as a column; zero-padded to the full 16 nibbles they
+/// align exactly, and dimming the padding keeps the significant digits
+/// dominant.
+///
+/// Built as one `LayoutJob` so the cell stays a single `Label` — one widget,
+/// one node in the accessibility tree, rather than two runs the UI
+/// Automation driver would have to stitch back together.
+fn hex_address_job(address: usize, on_wash: bool) -> egui::text::LayoutJob {
+    let full = format!("{address:016X}");
+    let significant = full.len() - full.trim_start_matches('0').len();
+    // An address of exactly zero is all padding; keep one digit significant
+    // so the cell never renders as entirely dim.
+    let split = significant.min(full.len() - 1);
+    let font = theme::font(theme::text_style::MONO_VALUE);
+    let pad_color = if on_wash {
+        theme::HEX_PAD_ON_WASH
+    } else {
+        theme::TEXT_FAINT
+    };
+
+    let mut job = egui::text::LayoutJob::default();
+    if split > 0 {
+        job.append(
+            &full[..split],
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: pad_color,
+                ..Default::default()
+            },
+        );
+    }
+    job.append(
+        &full[split..],
+        0.0,
+        egui::TextFormat {
+            font_id: font,
+            color: theme::TEXT,
+            ..Default::default()
+        },
+    );
+    job
 }
 
 fn filter_label(filter: ScanFilter) -> &'static str {
@@ -1319,10 +1855,199 @@ fn sorted_processes() -> Vec<ProcessInfo> {
     processes
 }
 
+impl FerriteApp {
+    /// The top bar: identity on the left, table actions on the right.
+    fn show_top_bar(&mut self, ui: &mut egui::Ui, window_width: f32) {
+        let icons_only = window_width < theme::breakpoint::TOPBAR_ICONS;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("FERRITE")
+                    .font(theme::font(theme::text_style::SECTION_LABEL))
+                    .color(theme::ACCENT),
+            );
+            ui.add_space(theme::space::MD);
+
+            match &self.attached {
+                Some(attached) => {
+                    ui.label(
+                        egui::RichText::new(&attached.process_name)
+                            .font(theme::font(theme::text_style::SECONDARY))
+                            .color(theme::TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("pid {}", attached.pid))
+                            .font(theme::font(theme::text_style::MONO_VALUE))
+                            .color(theme::TEXT_DIM),
+                    );
+                    if ui.button("Detach").clicked() {
+                        self.detach();
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("Not attached")
+                            .font(theme::font(theme::text_style::SECONDARY))
+                            .color(theme::TEXT_DIM),
+                    );
+                }
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.show_table_actions(ui, icons_only);
+            });
+        });
+    }
+
+    /// Detaches, dropping the handle and the freeze thread with it.
+    fn detach(&mut self) {
+        self.attached = None;
+        self.module_map = ModuleMap::empty();
+        self.scan_region_summary = None;
+        self.scan_history.clear();
+        self.changed_at.clear();
+        self.mark_saved_entries_unattached();
+    }
+
+    /// The left rail: what is attached, and every control that starts or
+    /// narrows a scan. It never collapses, because it holds the primary
+    /// action.
+    fn show_rail(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("rail_scroll")
+            .show(ui, |ui| {
+                theme::section_label(ui, "target");
+                ui.add_space(theme::space::SM);
+                match &self.attached {
+                    None => {
+                        ui.label(
+                            egui::RichText::new("No process attached")
+                                .font(theme::font(theme::text_style::EMPTY_HEADLINE)),
+                        );
+                        ui.add_space(theme::space::SM);
+                        ui.label(
+                            egui::RichText::new(
+                                "Pick a 64-bit process from the list. Ferrite reads and \
+                                 writes only data — it never injects or runs code in the \
+                                 target.",
+                            )
+                            .font(theme::font(theme::text_style::SECONDARY))
+                            .color(theme::TEXT_DIM),
+                        );
+                    }
+                    Some(_) => {
+                        if let Some((bytes, regions)) = self.scan_region_summary {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} across {regions} regions.",
+                                    format_bytes(bytes)
+                                ))
+                                .font(theme::font(theme::text_style::SECONDARY))
+                                .color(theme::TEXT_DIM),
+                            );
+                        }
+                        if !self.module_map.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} modules loaded.",
+                                    self.module_map.len()
+                                ))
+                                .font(theme::font(theme::text_style::SECONDARY))
+                                .color(theme::TEXT_DIM),
+                            );
+                        }
+                    }
+                }
+
+                ui.add_space(theme::space::XL);
+                self.show_scan_group(ui);
+
+                if self.attached.as_ref().is_some_and(|a| a.results.is_some()) {
+                    ui.add_space(theme::space::XL);
+                    self.show_rescan_group(ui);
+                    ui.add_space(theme::space::XL);
+                    self.show_write_group(ui);
+                }
+
+                ui.add_space(theme::space::XL);
+                ui.label(
+                    egui::RichText::new(
+                        "Reads and writes process data only. No code execution, no \
+                         network, no telemetry.",
+                    )
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(theme::TEXT_FAINT),
+                );
+            });
+    }
+
+    /// The central region once something is attached.
+    fn show_results_region(&mut self, ui: &mut egui::Ui, window_width: f32) {
+        if self.import_report.is_some() {
+            self.show_import_report(ui);
+            ui.add_space(theme::space::LG);
+        }
+        self.show_results_table(ui, window_width);
+    }
+
+    /// The saved-list dock. Docked rather than stacked, so nothing above it
+    /// can push it off the bottom of the window.
+    fn show_saved_dock(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            theme::section_label(ui, "saved list");
+            ui.add_space(theme::space::SM);
+            let frozen = self.saved.iter().filter(|r| r.entry.frozen).count();
+            let summary = match (self.saved.len(), frozen) {
+                (0, _) => "0 entries".to_string(),
+                (n, 0) => format!("{n} entries"),
+                (n, f) => format!("{n} entries · {f} frozen"),
+            };
+            ui.label(
+                egui::RichText::new(summary)
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(theme::TEXT_DIM),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Add manually").clicked() {
+                    self.manual_add_open = true;
+                }
+            });
+        });
+        ui.add_space(theme::space::SM);
+
+        if self.saved.is_empty() {
+            ui.label(
+                egui::RichText::new("Nothing saved yet")
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(theme::TEXT_DIM),
+            );
+            return;
+        }
+        self.show_saved_list_table(ui);
+    }
+
+    /// The manual-add form, as a modal rather than a section in a scroll: it
+    /// has its own validation, and it must not push the dock around.
+    fn show_manual_add_modal(&mut self, ctx: &egui::Context) {
+        if !self.manual_add_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Add address manually")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .frame(theme::panel(theme::SURFACE).stroke(theme::divider_stroke()))
+            .default_width(620.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| self.show_manual_add_form(ui));
+        self.manual_add_open &= open;
+    }
+}
+
 impl eframe::App for FerriteApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.check_target_exited();
-        self.refresh_live_values();
+        self.refresh_live_values(ui.input(|i| i.time));
         self.refresh_saved_entries();
         if self.attached.is_some() {
             // eframe only repaints reactively (on input) by default - an
@@ -1331,13 +2056,72 @@ impl eframe::App for FerriteApp {
             ui.ctx().request_repaint_after(LIVE_REFRESH_INTERVAL);
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.show_process_picker(ui);
-            self.show_scan_panel(ui);
-            self.show_results_table(ui);
-            self.show_manual_add_form(ui);
-            self.show_persistence_controls(ui);
-            self.show_saved_list_table(ui);
-        });
+        // One window, three regions. Declared top -> bottom -> left ->
+        // central because egui allocates panels in call order, and the top
+        // bar and the dock both span the full width while the rail only
+        // occupies what is left between them.
+        //
+        // Nothing here scrolls as a whole: each region owns its own scroll,
+        // which is the point. The saved-list dock cannot be pushed off the
+        // bottom of the window by anything above it, because nothing is
+        // above it.
+        // Captured before any panel is allocated, so it is the whole
+        // window's width rather than whatever is left after the rail.
+        let window_width = ui.available_width();
+
+        egui::Panel::top("top_bar")
+            .frame(theme::panel(theme::SURFACE_RAISED))
+            .show_separator_line(false)
+            .show(ui, |ui| self.show_top_bar(ui, window_width));
+        divider(ui);
+
+        egui::Panel::bottom("saved_dock")
+            .frame(theme::panel(theme::SURFACE))
+            .show_separator_line(false)
+            .resizable(true)
+            .min_size(theme::DOCK_HEIGHT_MIN)
+            .default_size(theme::DOCK_HEIGHT_MIN * 1.6)
+            .show(ui, |ui| self.show_saved_dock(ui));
+
+        egui::Panel::left("rail")
+            .frame(theme::panel(theme::SURFACE))
+            .show_separator_line(false)
+            .resizable(false)
+            .exact_size(rail_width(window_width))
+            .show(ui, |ui| self.show_rail(ui));
+
+        egui::CentralPanel::default()
+            .frame(theme::panel(theme::GROUND))
+            .show(ui, |ui| {
+                if self.attached.is_some() {
+                    self.show_results_region(ui, window_width);
+                } else {
+                    self.show_process_picker(ui);
+                }
+            });
+
+        self.show_manual_add_modal(ui.ctx());
     }
+}
+
+/// The rail's width at the current window size: its preferred 340 px,
+/// shrinking to a 300 px floor on a narrow window. It never collapses — it
+/// holds the primary action.
+fn rail_width(window_width: f32) -> f32 {
+    if window_width < theme::breakpoint::RAIL_SHRINK {
+        theme::RAIL_WIDTH_MIN
+    } else {
+        theme::RAIL_WIDTH
+    }
+}
+
+/// The 2 px rule that separates two regions. Drawn by hand rather than left
+/// to egui's own separator line, which is 1 px and takes its colour from the
+/// widget palette rather than from the divider token.
+fn divider(ui: &mut egui::Ui) {
+    let rect = ui.available_rect_before_wrap();
+    let y = rect.top();
+    ui.painter()
+        .hline(rect.x_range(), y, theme::divider_stroke());
+    ui.add_space(2.0);
 }

@@ -13,6 +13,7 @@ eframe = { version = "0.36.1", default-features = false, features = [
     "default_fonts",
     "accesskit",
 ] }
+egui_extras = "0.36"
 ferrite-core = { path = "../ferrite-core" }
 rfd = "0.17"
 

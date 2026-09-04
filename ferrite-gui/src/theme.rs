@@ -343,8 +343,12 @@ pub fn visuals() -> egui::Visuals {
     visuals.popup_shadow = egui::epaint::Shadow::NONE;
 
     // Selection: the accent wash, bounded, never a translucent highlight.
+    // The stroke is the accent rather than plain ink because egui draws a
+    // focused text field's frame with it — the spec's focus ring is 2 px of
+    // accent, and a white ring here would be the one un-themed edge in the
+    // interface.
     visuals.selection.bg_fill = ACCENT_WASH;
-    visuals.selection.stroke = egui::Stroke::new(1.0, TEXT);
+    visuals.selection.stroke = egui::Stroke::new(2.0, ACCENT);
 
     // The five states the spec specifies, mapped onto egui's five.
     // `noninteractive` is what `add_enabled(false)` renders, so it carries the
@@ -406,11 +410,26 @@ pub fn divider_stroke() -> egui::Stroke {
     egui::Stroke::new(2.0, DIVIDER)
 }
 
-/// A primary action: accent fill, ground-coloured ink.
-pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text).color(GROUND))
-        .fill(ACCENT)
-        .corner_radius(egui::CornerRadius::ZERO)
+/// A primary action: accent fill, ground-coloured ink — unless the
+/// surrounding `Ui` is disabled, in which case it takes the disabled
+/// treatment instead.
+///
+/// Takes the `Ui` rather than returning a bare `Button` because an explicit
+/// `.fill()` overrides egui's own disabled visuals: a greyed-out button
+/// would otherwise keep its full accent fill and still read as the thing to
+/// press.
+pub fn primary(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    let enabled = ui.is_enabled();
+    let (fill, ink) = if enabled {
+        (ACCENT, GROUND)
+    } else {
+        (SURFACE_RAISED, TEXT_FAINT)
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).color(ink))
+            .fill(fill)
+            .corner_radius(egui::CornerRadius::ZERO),
+    )
 }
 
 /// A section label — `SCAN`, `RESULTS`, `SAVED LIST`. Caps and tracked by
