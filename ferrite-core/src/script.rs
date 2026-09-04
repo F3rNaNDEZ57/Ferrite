@@ -62,6 +62,23 @@ pub enum ScriptKind {
     /// allocation inside the target and code injection — none of which
     /// Ferrite does.
     Assembler,
+    /// Lua that calls functions Ferrite does not provide, because they
+    /// assemble code, allocate inside the target or inject — the same
+    /// capabilities [`Self::Assembler`] needs, reached through Lua instead
+    /// of through assembly.
+    ///
+    /// **This is the shape most real Cheat Engine tables use**, and the
+    /// reason this variant exists. A modern table's "script" is often a
+    /// `{$LUA}` block that AOB-scans for a signature, calls
+    /// `allocateMemory`, builds an assembly string and passes it to
+    /// `autoAssemble`. Every line of it is Lua, so a source scan sees no
+    /// assembly at all — but it does exactly what an Auto Assembler script
+    /// does.
+    ///
+    /// Classifying these as runnable would offer an Enable button for
+    /// something that fails on its third line, which is a worse answer than
+    /// refusing them: the promise is what misleads, not the failure.
+    LuaNeedingInjection,
 }
 
 impl ScriptKind {
@@ -86,6 +103,11 @@ impl ScriptKind {
             Self::Assembler => {
                 "an Auto Assembler script — running it would mean assembling code, allocating \
                  memory inside the target and patching its execution, none of which Ferrite does"
+            }
+            Self::LuaNeedingInjection => {
+                "a Lua script that assembles and injects code — it calls Cheat Engine functions \
+                 for allocating memory inside the target and assembling instructions, which \
+                 Ferrite does not provide"
             }
         }
     }
@@ -149,6 +171,7 @@ impl Script {
         // Ordered most to least restrictive.
         for kind in [
             ScriptKind::Assembler,
+            ScriptKind::LuaNeedingInjection,
             ScriptKind::GenerativeLua,
             ScriptKind::DataOnlyLua,
         ] {
@@ -181,6 +204,12 @@ fn classify_half(blocks: &[Block]) -> ScriptKind {
         match block {
             Block::Assembler(text) if !assembler_is_blank(text) => return ScriptKind::Assembler,
             Block::Assembler(_) => {}
+            // Checked before the generative test: a script doing both is
+            // an injecting script, and that is the more useful thing to
+            // say about it.
+            Block::Lua(src) if lua_needs_injection(src) => {
+                return ScriptKind::LuaNeedingInjection;
+            }
             Block::Lua(src) if lua_returns_a_value(src) => kind = ScriptKind::GenerativeLua,
             Block::Lua(src) if !lua_is_blank(src) => {
                 if kind != ScriptKind::GenerativeLua {
@@ -319,6 +348,58 @@ fn assembler_is_blank(text: &str) -> bool {
     stripped.lines().all(|line| {
         let line = line.trim();
         line.is_empty() || line.starts_with("//")
+    })
+}
+
+/// Cheat Engine Lua functions that assemble, allocate inside the target, or
+/// inject — the capabilities [`ScriptKind::Assembler`] needs, reachable from
+/// Lua.
+///
+/// A script calling any of these is doing code injection whatever language
+/// it is written in, so it is classified [`ScriptKind::LuaNeedingInjection`]
+/// rather than data-only. This list is the *reason* for that variant, and it
+/// deliberately does not include the read/write/scan functions Ferrite does
+/// provide — `readBytes` and `writeBytes` next to `autoAssemble` is still an
+/// injecting script, but `readBytes` alone is not.
+const INJECTION_FUNCTIONS: &[&str] = &[
+    // Assembling and executing.
+    "autoAssemble",
+    "autoAssembleCheck",
+    "executeCode",
+    "executeCodeEx",
+    "executeCodeLocal",
+    "executeCodeLocalEx",
+    "createThread",
+    "createNativeThread",
+    "injectDLL",
+    "loadLibrary",
+    // Allocating inside the target, which only injection needs.
+    "allocateMemory",
+    "allocateSharedMemory",
+    "allocateSharedMemoryLocal",
+    "deAlloc",
+    "deAllocLocal",
+    // Debugger.
+    "debugProcess",
+    "debug_setBreakpoint",
+    "createProcessWatcher",
+];
+
+/// Whether Lua source calls anything in [`INJECTION_FUNCTIONS`].
+///
+/// Matches a whole identifier followed by `(`, so `autoAssemble(...)` counts
+/// and a mention inside a comment or a string does not — comments and string
+/// contents are stripped first.
+fn lua_needs_injection(src: &str) -> bool {
+    let code = strip_lua_comments_and_strings(src);
+    INJECTION_FUNCTIONS.iter().any(|name| {
+        code.match_indices(name).any(|(at, _)| {
+            let before_ok = at == 0 || !is_word_byte(code.as_bytes()[at - 1]);
+            let after = &code[at + name.len()..];
+            // A method call (`obj:autoAssemble(...)`) is something else.
+            let not_a_method = at == 0 || !matches!(code.as_bytes()[at - 1], b'.' | b':');
+            before_ok && not_a_method && after.trim_start().starts_with('(')
+        })
     })
 }
 
@@ -537,6 +618,63 @@ mod tests {
         // ...and a word merely containing it isn't either.
         assert!(!lua_returns_a_value("returned = 1"));
         assert!(!lua_returns_a_value("local myreturn = 2"));
+    }
+
+    #[test]
+    fn lua_that_assembles_and_injects_is_not_data_only() {
+        // The shape most real Cheat Engine tables use, and the one this
+        // classifier originally got wrong: every line is Lua, so a source
+        // scan sees no assembly - but it AOB-scans for a signature,
+        // allocates inside the target, builds an assembly string and hands
+        // it to autoAssemble. Calling that "data-only" would offer an
+        // Enable button for something that fails on its third line.
+        let script = parse_script(
+            "[ENABLE]\n\
+             {$lua}\n\
+             addr = AOBScanModuleUnique(process, \"0F 57 C9\")\n\
+             mem = allocateMemory(100, addr)\n\
+             local a, b = autoAssemble(\"jmp \" .. mem, false)\n\
+             {$asm}",
+        )
+        .expect("parses");
+        assert_eq!(script.kind(), ScriptKind::LuaNeedingInjection);
+        assert!(!script.kind().is_runnable());
+        assert!(script.kind().reason().contains("assembles and injects"));
+    }
+
+    #[test]
+    fn the_injection_check_looks_for_calls_not_mentions() {
+        // A script that reads and writes is still data-only, even if it
+        // talks about injection in a comment or a string.
+        assert!(!lua_needs_injection("writeInteger(a, 1)"));
+        assert!(!lua_needs_injection("-- we do not autoAssemble(x) here"));
+        assert!(!lua_needs_injection("print('autoAssemble(x)')"));
+        assert!(!lua_needs_injection("local autoAssembleNote = 1"));
+        assert!(!lua_needs_injection("obj:allocateMemory(1)"));
+
+        // ...and a real call counts however it is spaced.
+        assert!(lua_needs_injection("autoAssemble(s, false)"));
+        assert!(lua_needs_injection("local m = allocateMemory (100, addr)"));
+        assert!(lua_needs_injection("deAlloc(mem)"));
+        assert!(lua_needs_injection("injectDLL('x.dll')"));
+    }
+
+    #[test]
+    fn reading_and_writing_alone_stays_runnable() {
+        // The distinction that keeps the feature useful: readBytes beside
+        // autoAssemble is an injecting script, but readBytes alone is not.
+        let script = parse_script(
+            "{$lua}\n\
+             if syntaxcheck then return end\n\
+             local hp = getAddress('game.exe+1C58DA0')\n\
+             [ENABLE]\n\
+             writeInteger(hp, 9999)\n\
+             [DISABLE]\n\
+             writeInteger(hp, 100)",
+        )
+        .expect("parses");
+        assert_eq!(script.kind(), ScriptKind::DataOnlyLua);
+        assert!(script.kind().is_runnable());
     }
 
     #[test]

@@ -765,7 +765,7 @@ mod tests {
         // Nothing runs, and nothing imports: no interpreter exists yet, and
         // an Auto Assembler entry has no address to import as a value.
         assert_eq!(report.imported.len(), 0);
-        assert_eq!(report.skipped.len(), 7, "{:#?}", report.skipped);
+        assert_eq!(report.skipped.len(), 8, "{:#?}", report.skipped);
 
         let by = |description: &str| {
             report
@@ -785,6 +785,11 @@ mod tests {
             (
                 "Ammo hook (Lua helper plus assembly)",
                 Some(ScriptKind::Assembler),
+            ),
+            // All Lua, no assembly in sight - and still injection.
+            (
+                "Max durability (Lua that injects)",
+                Some(ScriptKind::LuaNeedingInjection),
             ),
             ("Placeholder (comments only)", Some(ScriptKind::Empty)),
             // Cheat Engine rejects two [ENABLE] sections outright, so this

@@ -100,6 +100,36 @@ ammoHook:
 </AssemblerScript>
     </CheatEntry>
 
+    <!-- 4b. Lua that injects: every line is Lua, so no source scan sees
+            assembly - but it AOB-scans, allocates inside the target, builds
+            an assembly string and hands it to autoAssemble. This is the
+            shape most real Cheat Engine tables use, and the classifier
+            called it data-only until a real Grounded table proved
+            otherwise. -->
+    <CheatEntry>
+      <ID>8</ID>
+      <Description>"Max durability (Lua that injects)"</Description>
+      <LastState/>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+addr = AOBScanModuleUnique(process, "0F 57 C9 0F 2F C1 76 ??")
+original = readBytes(addr, 6, true)
+newmem = allocateMemory(100, addr)
+registerSymbol("addr", addr)
+local a, b = autoAssemble("jmp newmem
+nop", false)
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+writeBytes(addr, original)
+deAlloc(newmem)
+unregisterSymbol("addr")
+</AssemblerScript>
+    </CheatEntry>
+
     <!-- 5. Comments only: nothing to run in either half. -->
     <CheatEntry>
       <ID>5</ID>

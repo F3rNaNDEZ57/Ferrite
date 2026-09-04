@@ -2580,6 +2580,10 @@ fn script_kind_chip(ui: &mut egui::Ui, kind: Option<ScriptKind>) {
             "generates code",
             "Its Lua returns assembly, so running only the Lua would leave the              target partly modified.",
         ),
+        Some(ScriptKind::LuaNeedingInjection) => (
+            "Lua, injects code",
+            "Written in Lua, but it assembles instructions and allocates memory inside the              target. Ferrite does neither, so this cannot run.",
+        ),
         Some(ScriptKind::Assembler) => (
             "Auto Assembler",
             "Assembles code, allocates memory inside the target and patches its              execution. Ferrite does none of that.",
