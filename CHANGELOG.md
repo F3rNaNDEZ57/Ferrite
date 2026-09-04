@@ -10,6 +10,30 @@ Pre-1.0, a minor version bump may carry a breaking change — see `0.2.0`.
 
 Nothing yet.
 
+## [1.1.1] — 2026-09-04
+
+[Release](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.1.1)
+
+### Fixed
+
+- **A table's own `<LuaScript>` is now shown.** That element belongs to no
+  entry, and Ferrite wasn't reading it at all — so it never appeared in the
+  import report.
+
+  It matters because **Cheat Engine runs `<LuaScript>` the moment a table
+  is opened**: no entry enabled, nothing clicked. It is simultaneously the
+  most security-relevant part of a downloaded table and the part you are
+  least likely to know is there, and Ferrite was hiding it from the one
+  screen built to show you what a table would do.
+
+  Ferrite still never runs it, and — unlike an entry's script — does not
+  offer to. An auto-run script presented as something you opt into would
+  misrepresent what the table was built to do.
+
+Found by importing a real downloaded `.CT` rather than a test fixture.
+Every script fixture written for 1.1.0 exercised the classifier, and none
+carried a `<LuaScript>`.
+
 ## [1.1.0] — 2026-09-04
 
 [Release](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.1.0)
@@ -289,7 +313,8 @@ load a cheat table**.
 - Process-list icons, native file dialogs, a dark theme, and the
   application's own icon.
 
-[Unreleased]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/F3rNaNDEZ57/Ferrite/compare/v0.2.0...v0.3.0
