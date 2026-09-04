@@ -68,7 +68,7 @@ It reads and writes process **data**. It never injects or executes code
 **in the target process**, never touches the network, and collects
 nothing.
 
-**Current release: [v1.0.0](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.0.0)**
+**Current release: [v1.1.2](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.1.2)**
 · [Download](https://github.com/F3rNaNDEZ57/Ferrite/releases/latest)
 · [Changelog](https://github.com/F3rNaNDEZ57/Ferrite/blob/main/CHANGELOG.md)
 
@@ -87,6 +87,9 @@ For how to build and run it, see the
 
 | Version | What it was | Notes |
 | --- | --- | --- |
+| [v1.1.2](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.1.2) | Lua that injects code is no longer offered as runnable — most real tables' cheats turn out to be injection whichever language they are written in | [[progress-log]] |
+| [v1.1.1](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.1.1) | A table's own `<LuaScript>`, which Cheat Engine runs on open, is shown rather than ignored | [[progress-log]] |
+| [v1.1.0](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.1.0) | Data-only Lua cheat-table scripts run, in a sandboxed interpreter | [[v1.1-scope]] · [[v1.1-plan]] |
 | [v1.0.0](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v1.0.0) | The interface rebuilt: three docked regions, a virtualised results table, fixed-width aligned hex, and the `.CT` import report as a split view for reading a downloaded table's script before trusting it | [[v1.0-notes]] |
 | [v0.3.0](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v0.3.0) | `Pointer` and `Array of byte` `.CT` entries, `<ShowAsHex>`, case-insensitive type names | [[v0.3-notes]] |
 | [v0.2.0](https://github.com/F3rNaNDEZ57/Ferrite/releases/tag/v0.2.0) | String value types, multi-level pointer chains, script-text display for entries Ferrite can't run | [[v0.2-scope]] · [[v0.2-plan]] |
@@ -96,7 +99,6 @@ For how to build and run it, see the
 
 | Version | What it would be | Notes |
 | --- | --- | --- |
-| `v1.1.0` | Run the data-only subset of `{$LUA}` cheat-table scripts, sandboxed | [[v1.1-scope]] · [[v1.1-plan]] |
 | `v2.0.0` | Auto Assembler execution — assembling, allocation in the target, code injection | [[v2.0-scope]] |
 
 These two are often asked for as one thing — "run the Lua cheats" — and
