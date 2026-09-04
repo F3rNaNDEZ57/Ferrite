@@ -1831,6 +1831,45 @@ impl FerriteApp {
                 .color(theme::TEXT_FAINT),
             );
         }
+
+        // The table's own script, which belongs to no entry. Cheat Engine
+        // runs this the moment the table is opened, so it is the one piece
+        // of a downloaded table nobody consented to - and therefore the one
+        // most worth putting in front of someone. Accented because it is a
+        // "read this" rather than a fact about an entry.
+        if let Some(script) = self
+            .import_report
+            .as_ref()
+            .and_then(|r| r.table_script.clone())
+        {
+            ui.add_space(theme::space::SM);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "This table carries a script of its own, outside any entry. Cheat \
+                         Engine would have run it the moment the table was opened. Ferrite \
+                         did not run it — it is shown here so you can see what opening this \
+                         table in Cheat Engine would have done.",
+                    )
+                    .font(theme::font(theme::text_style::SECONDARY))
+                    .color(theme::ACCENT_LIFT),
+                )
+                .wrap(),
+            );
+            ui.add_space(theme::space::XS);
+            egui::CollapsingHeader::new("Show the table's own script")
+                .id_salt("table_script")
+                .default_open(false)
+                .show(ui, |ui| {
+                    let mut text = script.as_str();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut text)
+                            .font(egui::TextStyle::Name(theme::text_style::MONO_VALUE.into()))
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(script.lines().count().clamp(3, 20)),
+                    );
+                });
+        }
         ui.add_space(theme::space::MD);
 
         if skipped == 0 {

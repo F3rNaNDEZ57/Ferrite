@@ -23,6 +23,14 @@ use crate::text::TextEncoding;
 struct CheatTableXml {
     #[serde(rename = "CheatEntries", default)]
     cheat_entries: Option<CheatEntriesXml>,
+    /// The table's own `<LuaScript>`, which belongs to no entry.
+    ///
+    /// **Cheat Engine runs this automatically when the table is opened** —
+    /// no entry is enabled, nothing is clicked. That makes it the most
+    /// security-relevant part of a downloaded `.CT` file, and the part a
+    /// user is least likely to know exists.
+    #[serde(rename = "LuaScript", default)]
+    lua_script: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -126,6 +134,15 @@ pub struct ImportReport {
     /// default, not a cosmetic one - see the vault's `v0.1-plan.md`. This list
     /// is purely informational, for the caller to surface.
     pub was_active_in_source: Vec<String>,
+    /// The table's own `<LuaScript>`, if it has one.
+    ///
+    /// Ferrite **never runs this**, and unlike an entry's script it is not
+    /// offered as runnable at all: Cheat Engine executes it on open, so
+    /// treating it as something a user opts into would misrepresent what
+    /// the table was built to do. It is surfaced so it can be *read* —
+    /// a table whose auto-run script is invisible is a table whose most
+    /// security-relevant part is invisible.
+    pub table_script: Option<String>,
 }
 
 /// Why importing a `.CT` file failed outright (the whole file, not one
@@ -170,7 +187,15 @@ pub fn import_ct_file(path: &Path) -> Result<ImportReport, CtImportError> {
 /// no file needed.
 pub fn import_ct_xml(xml: &str) -> Result<ImportReport, CtImportError> {
     let table: CheatTableXml = quick_xml::de::from_str(xml)?;
-    let mut report = ImportReport::default();
+    let mut report = ImportReport {
+        table_script: table
+            .lua_script
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
+        ..Default::default()
+    };
     if let Some(entries) = &table.cheat_entries {
         import_entries(&entries.entry, "", &mut report);
     }
@@ -801,6 +826,40 @@ mod tests {
                 "{description:?} lost its script text"
             );
         }
+    }
+
+    #[test]
+    fn a_tables_own_lua_script_is_surfaced_rather_than_ignored() {
+        // Cheat Engine runs <LuaScript> automatically when the table is
+        // opened - nothing is clicked, no entry is enabled. Ferrite never
+        // runs it, but ignoring the element entirely would hide the most
+        // security-relevant part of a downloaded table from the one screen
+        // built to show you what that table would do.
+        let report = import_ct_xml(
+            "<CheatTable><CheatEntries/>\
+             <LuaScript>shellExecute(\"https://example.com\")</LuaScript>\
+             </CheatTable>",
+        )
+        .expect("parsing");
+        assert_eq!(
+            report.table_script.as_deref(),
+            Some("shellExecute(\"https://example.com\")")
+        );
+
+        // Absent and blank both report nothing, rather than an empty string
+        // the report would render as a heading with no content.
+        assert_eq!(
+            import_ct_xml("<CheatTable><CheatEntries/></CheatTable>")
+                .expect("parsing")
+                .table_script,
+            None
+        );
+        assert_eq!(
+            import_ct_xml("<CheatTable><CheatEntries/><LuaScript>  </LuaScript></CheatTable>")
+                .expect("parsing")
+                .table_script,
+            None
+        );
     }
 
     #[test]
