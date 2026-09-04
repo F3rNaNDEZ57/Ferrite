@@ -128,9 +128,175 @@ pub fn module_base(session: &ProcessSession, name: &str) -> Result<usize, Module
         .ok_or(ModuleError::NotFound)
 }
 
+/// An address expressed relative to the module that contains it — the
+/// `module.exe+1C58DA0` form a saved table uses, recovered from a bare
+/// address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleOffset {
+    pub module: String,
+    pub offset: usize,
+}
+
+impl std::fmt::Display for ModuleOffset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}+{:X}", self.module, self.offset)
+    }
+}
+
+/// A snapshot of the target's modules, sorted by base address, for turning
+/// an address back into `module+offset`.
+///
+/// Built once and reused, rather than resolved per address: the results
+/// table asks this question for every visible row on a 100 ms tick, and
+/// [`list_modules`] is a full `EnumProcessModulesEx` walk plus a
+/// `GetModuleFileNameExW` per module. Doing that per row per tick would be
+/// hundreds of process queries a second to answer a question whose answer
+/// only changes when a module is loaded or unloaded.
+///
+/// It is a *snapshot*, deliberately: it goes stale if the target loads a
+/// DLL, and the caller decides when to rebuild (the GUI does so on attach
+/// and on a new scan). A stale map resolves an address in a newly-loaded
+/// module to `None` rather than to something wrong.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleMap {
+    /// Sorted by `base`, ascending. Module images don't overlap, so the
+    /// containing module is always the last one whose base is at or below
+    /// the address.
+    sorted: Vec<ModuleInfo>,
+}
+
+impl ModuleMap {
+    /// Takes a snapshot of the attached process's modules.
+    pub fn build(session: &ProcessSession) -> Result<Self, MemoryError> {
+        let mut sorted = list_modules(session)?;
+        sorted.sort_unstable_by_key(|m| m.base);
+        Ok(Self { sorted })
+    }
+
+    /// An empty map, which resolves nothing. What the GUI holds while
+    /// detached.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sorted.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.sorted.len()
+    }
+
+    /// Resolves `address` to the module containing it, or `None` if it falls
+    /// in no module's image — which is the common case for a heap or stack
+    /// address, not an error.
+    pub fn resolve(&self, address: usize) -> Option<ModuleOffset> {
+        // The last module whose base is <= address; binary search rather
+        // than a scan, since this runs per visible row per tick.
+        let index = self.sorted.partition_point(|m| m.base <= address);
+        let module = self.sorted.get(index.checked_sub(1)?)?;
+        // partition_point only established base <= address. The address can
+        // still sit in the gap past this module's image and before the next
+        // one, so the upper bound has to be checked explicitly.
+        (address < module.base.checked_add(module.size)?).then(|| ModuleOffset {
+            module: module.name.clone(),
+            offset: address - module.base,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A map built from literal values, so the resolution logic is testable
+    /// without depending on where Windows happened to load anything.
+    fn map_of(modules: &[(&str, usize, usize)]) -> ModuleMap {
+        let mut sorted: Vec<ModuleInfo> = modules
+            .iter()
+            .map(|(name, base, size)| ModuleInfo {
+                name: (*name).to_string(),
+                base: *base,
+                size: *size,
+            })
+            .collect();
+        sorted.sort_unstable_by_key(|m| m.base);
+        ModuleMap { sorted }
+    }
+
+    #[test]
+    fn resolves_an_address_to_the_module_that_contains_it() {
+        let map = map_of(&[
+            ("game.exe", 0x1000, 0x1000),
+            ("unityplayer.dll", 0x5000, 0x2000),
+        ]);
+        assert_eq!(
+            map.resolve(0x1000),
+            Some(ModuleOffset {
+                module: "game.exe".to_string(),
+                offset: 0,
+            }),
+            "the base address itself is inside the module"
+        );
+        assert_eq!(map.resolve(0x1234).unwrap().to_string(), "game.exe+234");
+        assert_eq!(
+            map.resolve(0x6000).unwrap().to_string(),
+            "unityplayer.dll+1000"
+        );
+    }
+
+    #[test]
+    fn an_address_in_the_gap_between_two_modules_resolves_to_nothing() {
+        // The trap this guards: a binary search only establishes
+        // `base <= address`. Without checking the module's size too, every
+        // heap and stack address would be reported as an offset into
+        // whichever module happens to sit below it - a plausible-looking,
+        // entirely wrong `module+offset`.
+        let map = map_of(&[
+            ("game.exe", 0x1000, 0x1000),
+            ("unityplayer.dll", 0x5000, 0x2000),
+        ]);
+        assert_eq!(map.resolve(0x2000), None, "one past game.exe's last byte");
+        assert_eq!(map.resolve(0x3FFF), None, "the gap between the two");
+        assert_eq!(map.resolve(0x7000), None, "past the last module");
+        assert_eq!(map.resolve(0x0), None, "below the first module");
+    }
+
+    #[test]
+    fn an_empty_map_resolves_nothing_rather_than_panicking() {
+        assert_eq!(ModuleMap::empty().resolve(0x1000), None);
+        assert!(ModuleMap::empty().is_empty());
+    }
+
+    #[test]
+    fn a_real_map_resolves_an_address_inside_our_own_exe() {
+        let session =
+            ProcessSession::attach(std::process::id()).expect("attaching to our own process");
+        let map = ModuleMap::build(&session).expect("building a module map");
+        assert!(!map.is_empty());
+
+        // A function pointer in this very binary must land inside some
+        // loaded module - proof the map works against real module layout,
+        // not just synthetic bases.
+        let somewhere_in_our_exe =
+            a_real_map_resolves_an_address_inside_our_own_exe as fn() as usize;
+        let resolved = map
+            .resolve(somewhere_in_our_exe)
+            .expect("a code address should fall inside a loaded module");
+        assert!(
+            resolved.module.ends_with(".exe") || resolved.module.ends_with(".dll"),
+            "unexpected module {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn a_stack_address_falls_in_no_module() {
+        let session =
+            ProcessSession::attach(std::process::id()).expect("attaching to our own process");
+        let map = ModuleMap::build(&session).expect("building a module map");
+        let local = 0u64;
+        assert_eq!(map.resolve(&raw const local as usize), None);
+    }
 
     #[test]
     fn our_own_process_lists_its_own_exe_module() {

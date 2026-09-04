@@ -27,9 +27,9 @@ pub use aob::{
 pub use ct_import::{CtImportError, ImportReport, SkippedEntry, import_ct_file, import_ct_xml};
 pub use freeze::{DEFAULT_FREEZE_INTERVAL, FreezeHandle};
 pub use icon::{IconRgba, extract_icon_rgba};
-pub use modules::{ModuleError, ModuleInfo, list_modules, module_base};
+pub use modules::{ModuleError, ModuleInfo, ModuleMap, ModuleOffset, list_modules, module_base};
 pub use pointer::{MAX_POINTER_CHAIN_DEPTH, resolve_pointer, resolve_pointer_chain};
-pub use process::{ProcessInfo, list_processes};
+pub use process::{Arch, ProcessInfo, list_processes};
 pub use regions::MemoryRegion;
 pub use scan::{
     FirstScanResult, ScanMatch, ScanOptions, first_scan_exact, next_scan, scan_region_exact,

@@ -39,11 +39,16 @@ pub fn format_pattern(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-/// One matched address from an AOB scan, with the bytes found there.
+/// One matched address from an AOB scan, with the bytes found there and the
+/// ones it held before the most recent re-read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AobMatch {
     pub address: usize,
     pub bytes: Vec<u8>,
+    /// What `bytes` were before the last [`next_scan_aob`], for the same
+    /// reason [`crate::scan::ScanMatch::previous`] exists — equal to `bytes`
+    /// on a first scan.
+    pub previous: Vec<u8>,
 }
 
 /// Result of an AOB first scan. `capped` mirrors
@@ -141,6 +146,8 @@ fn scan_bytes_for_pattern(base_address: usize, bytes: &[u8], pattern: &[u8]) -> 
             matches.push(AobMatch {
                 address: base_address + start,
                 bytes: pattern.to_vec(),
+                // Nothing has changed yet on a first scan.
+                previous: pattern.to_vec(),
             });
         }
     }
@@ -171,6 +178,9 @@ pub fn next_scan_aob(
             passes.then_some(AobMatch {
                 address: m.address,
                 bytes,
+                // What this scan compared against becomes the previous
+                // value, mirroring `next_scan`.
+                previous: m.bytes.clone(),
             })
         })
         .collect()

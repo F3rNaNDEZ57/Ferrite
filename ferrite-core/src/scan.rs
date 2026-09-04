@@ -42,11 +42,22 @@ impl Default for ScanOptions {
     }
 }
 
-/// One matched address from a scan, with the value found there.
+/// One matched address from a scan, with the value found there and the one
+/// it held before the most recent re-read.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScanMatch {
     pub address: usize,
     pub value: ScanValue,
+    /// What `value` was before the last [`next_scan`]. Equal to `value` on a
+    /// first scan, where there is no earlier reading to show — not an
+    /// `Option`, because "no previous value yet" and "unchanged since the
+    /// last scan" render identically and an `Option` would only push that
+    /// decision out to every call site.
+    ///
+    /// Deliberately *not* updated by the GUI's live refresh: this is the
+    /// value at the previous **scan**, which is what a rescan filtered on,
+    /// and it would stop meaning that if a background tick moved it.
+    pub previous: ScanValue,
 }
 
 /// Result of a first scan. `capped` is true if `max_results` was hit before
@@ -114,6 +125,10 @@ pub fn next_scan(
             passes_filter(m.value, new_value, filter).then_some(ScanMatch {
                 address: m.address,
                 value: new_value,
+                // The value this scan filtered against becomes the previous
+                // one, so the column always shows what the comparison was
+                // actually made with.
+                previous: m.value,
             })
         })
         .collect()
@@ -198,9 +213,12 @@ fn scan_bytes_for_value(
         let local_offset = candidate - base_address;
         let slice = &bytes[local_offset..local_offset + value_size];
         if bytes_match_exact(slice, target, float_decimals) {
+            let found = target.from_le_bytes_like(slice);
             matches.push(ScanMatch {
                 address: candidate,
-                value: target.from_le_bytes_like(slice),
+                value: found,
+                // Nothing has changed yet on a first scan.
+                previous: found,
             });
         }
         candidate += value_size;

@@ -7,8 +7,8 @@ mod common;
 
 use common::Victim;
 use ferrite_core::{
-    AddressExpr, CheatEntry, EntryValue, ProcessSession, ResolveError, ScanValue, list_modules,
-    module_base, resolve_address, resolve_pointer,
+    AddressExpr, CheatEntry, EntryValue, ModuleMap, ProcessSession, ResolveError, ScanValue,
+    list_modules, module_base, resolve_address, resolve_pointer,
 };
 
 #[test]
@@ -151,4 +151,41 @@ fn cheat_entry_with_missing_module_reports_which_one() {
         Err(ResolveError::ModuleNotFound(module)) => assert_eq!(module, "not-loaded.exe"),
         other => panic!("expected ModuleNotFound, got {other:?}"),
     }
+}
+
+#[test]
+fn a_module_map_turns_a_victim_address_back_into_module_plus_offset() {
+    // The reverse of `module_base`, against a real separate process: the
+    // results table shows every row's address this way, so it has to work
+    // cross-process and not just within our own image.
+    let victim = Victim::spawn();
+    let session = ProcessSession::attach(victim.pid()).expect("attaching to the victim process");
+
+    let map = ModuleMap::build(&session).expect("building the victim's module map");
+    assert!(!map.is_empty());
+
+    // HP is a static in the victim's own image, so it must resolve - and
+    // resolving it back through `module_base` has to land on the same
+    // address the map started from.
+    let hp = victim.address_of("HP");
+    let resolved = map
+        .resolve(hp)
+        .expect("a static in the victim's exe should fall inside a loaded module");
+    assert!(
+        resolved.module.eq_ignore_ascii_case("ferrite-victim.exe"),
+        "expected ferrite-victim.exe, got {resolved:?}"
+    );
+
+    let base = module_base(&session, &resolved.module).expect("resolving the module back");
+    assert_eq!(
+        base + resolved.offset,
+        hp,
+        "module+offset must round-trip to the address it came from"
+    );
+
+    // A heap or stack address in the victim falls in no module at all -
+    // `None`, not a wrong offset into whichever module sits below it.
+    let ptr_target = ferrite_core::resolve_pointer(&session, victim.address_of("PTR2"), 0)
+        .expect("dereferencing PTR2");
+    assert!(map.resolve(ptr_target).is_some(), "PTR is also a static");
 }
