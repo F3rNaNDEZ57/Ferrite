@@ -94,8 +94,11 @@ Engine's own Lua API — and, for plain Auto Assembler scripts, an x86-64
 assembler and code-injection machinery. Ferrite only ever touches data,
 never patches code or redirects execution.
 
-Full scope, architecture, and milestone plan live in the project's
-planning vault (maintained alongside this repository).
+Full scope, architecture, and the decisions log live in the
+[wiki](https://github.com/F3rNaNDEZ57/Ferrite/wiki) — the project's
+planning notes, including why Ferrite does several things the way it does
+and which Cheat Engine format details were read out of CE's own source
+rather than inferred.
 
 ## License
 
