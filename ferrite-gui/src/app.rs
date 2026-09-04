@@ -237,7 +237,7 @@ enum Results {
 /// persisted (only the `CheatEntry` itself is saved/loaded). Recomputed each
 /// throttled refresh tick so the saved list always shows *some* status per
 /// entry, independent of whether a process is attached at all (see the
-/// vault's `v1-plan.md`: loading while detached, or attached to the wrong
+/// vault's `v0.1-plan.md`: loading while detached, or attached to the wrong
 /// process, must never silently drop entries).
 #[derive(Clone)]
 enum RowStatus {
@@ -472,7 +472,7 @@ impl FerriteApp {
     /// Re-resolves every saved entry's address against the attached
     /// session, throttled like `refresh_live_values`. Runs independently of
     /// whether a scan has ever happened - the saved list is its own thing,
-    /// not derived from scan results (see the vault's `v1-plan.md`).
+    /// not derived from scan results (see the vault's `v0.1-plan.md`).
     fn refresh_saved_entries(&mut self) {
         let Some(attached) = &self.attached else {
             return;
@@ -494,7 +494,7 @@ impl FerriteApp {
                     // while detached, attach happens later" and "loaded
                     // while already attached"), before the live-read below
                     // would otherwise overwrite it. See the vault's
-                    // `v1-plan.md`.
+                    // `v0.1-plan.md`.
                     if !was_resolved && row.entry.frozen && !attached.freeze.is_frozen(address) {
                         attached
                             .freeze
@@ -536,7 +536,7 @@ impl FerriteApp {
     /// attach with no scan yet, or a scan with nothing checked). This method
     /// already touches the session on a timer regardless of freeze state,
     /// so it's the natural place to close that gap with one extra cheap
-    /// call - see the "Known scope limit" note in the vault's `v1-plan.md`.
+    /// call - see the "Known scope limit" note in the vault's `v0.1-plan.md`.
     fn refresh_live_values(&mut self, now: f64) {
         let Some(attached) = &mut self.attached else {
             return;
@@ -1596,7 +1596,7 @@ impl FerriteApp {
 
     /// Save/load controls: a plain path text field plus two buttons - no
     /// native file dialog for v1 (a decided simplification, see the vault's
-    /// `v1-plan.md`).
+    /// `v0.1-plan.md`).
     /// The table actions in the top bar. Labels drop to icons on a narrow
     /// window, but the process identity and Detach always stay in words.
     ///
@@ -1675,7 +1675,7 @@ impl FerriteApp {
     }
 
     /// The visible unsupported-entries report `.CT` import must show, per
-    /// the vault's `v1-scope.md` - every skipped entry with its description
+    /// the vault's `v0.1-scope.md` - every skipped entry with its description
     /// and reason, not just a log line, plus the informational note about
     /// entries that were frozen in the source table (see
     /// `ImportReport::was_active_in_source` in `ferrite-core::ct_import`).

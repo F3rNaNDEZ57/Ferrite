@@ -2,7 +2,7 @@
 //!
 //! Ownership model: a [`ProcessSession`] wraps exactly one open process
 //! handle and closes it automatically on drop (RAII); it is intentionally
-//! not `Clone`. See the concurrency model in the vault's `v1-plan.md`.
+//! not `Clone`. See the concurrency model in the vault's `v0.1-plan.md`.
 
 use core::ffi::c_void;
 
@@ -100,7 +100,7 @@ impl From<windows::core::Error> for AttachError {
 
 /// An open handle to a running process. Closes the handle automatically on
 /// drop; not `Clone` — only one session is meant to be active at a time (see
-/// the concurrency model in the vault's `v1-plan.md`).
+/// the concurrency model in the vault's `v0.1-plan.md`).
 pub struct ProcessSession {
     handle: HANDLE,
     pid: u32,
@@ -112,13 +112,13 @@ pub struct ProcessSession {
 // safe to call concurrently, from any thread, on the same handle. This lets
 // the freeze thread (`freeze.rs`) share one session with the GUI thread via
 // `Arc<ProcessSession>` (`Arc<T>: Send` requires `T: Send + Sync`) - see the
-// concurrency model in the vault's `v1-plan.md`.
+// concurrency model in the vault's `v0.1-plan.md`.
 unsafe impl Send for ProcessSession {}
 unsafe impl Sync for ProcessSession {}
 
 impl ProcessSession {
     /// Opens `pid` with exactly the access rights v1 needs — not
-    /// `PROCESS_ALL_ACCESS` — per the vault's `v1-scope.md`.
+    /// `PROCESS_ALL_ACCESS` — per the vault's `v0.1-scope.md`.
     pub fn attach(pid: u32) -> Result<Self, AttachError> {
         let access =
             PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION;

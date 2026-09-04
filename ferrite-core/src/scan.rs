@@ -18,7 +18,7 @@ pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
 /// Stop a first scan once this many matches are found, rather than
 /// potentially returning millions of results into a `Vec`/GUI table that
 /// would hang the first demo. A correctness floor for M1, not later polish
-/// — see the vault's `v1-plan.md`.
+/// — see the vault's `v0.1-plan.md`.
 pub const DEFAULT_MAX_RESULTS: usize = 50_000;
 
 /// Tunable parameters for a scan. `Default` gives sane values for real use;

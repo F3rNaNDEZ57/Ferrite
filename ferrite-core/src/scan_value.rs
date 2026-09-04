@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use serde::{Deserialize, Serialize};
 
 /// A value the scan engine can search for or compare — the numeric types in
-/// v1's scan matrix (see the vault's `v1-scope.md`).
+/// v1's scan matrix (see the vault's `v0.1-scope.md`).
 ///
 /// Byte-pattern (AOB) scanning is a separate code path, not a variant here:
 /// it's a substring search over arbitrary-length byte patterns, mechanically

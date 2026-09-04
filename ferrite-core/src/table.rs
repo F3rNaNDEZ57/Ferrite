@@ -1,7 +1,7 @@
 //! The entry model for a saved "cheat table" (see the vault's
-//! `v1-scope.md`) and its plain-JSON save/load — our own portable format,
+//! `v0.1-scope.md`) and its plain-JSON save/load — our own portable format,
 //! not a Cheat Engine `.CT` file (that's a separate importer, not built
-//! here; see the vault's `v1-plan.md`).
+//! here; see the vault's `v0.1-plan.md`).
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -17,7 +17,7 @@ use crate::text::TextEncoding;
 
 /// How a saved entry's address is expressed.
 ///
-/// Verified against real Cheat Engine tables (see the vault's `v1-plan.md`):
+/// Verified against real Cheat Engine tables (see the vault's `v0.1-plan.md`):
 /// nearly every real-world entry is module-relative, not absolute — an
 /// absolute address only really survives across the same process's own
 /// relaunches within a single boot (ASLR bias is chosen once per image per
@@ -84,7 +84,7 @@ pub struct CheatEntry {
     /// The last-known/saved value. Also what a frozen entry is pinned to
     /// immediately on load — deterministic "restore this cheat" behavior,
     /// not a re-read of whatever's currently at the address (a decided
-    /// choice, see the vault's `v1-plan.md`).
+    /// choice, see the vault's `v0.1-plan.md`).
     pub value: EntryValue,
     pub frozen: bool,
     /// Show this entry's value as hexadecimal rather than decimal — Cheat
@@ -125,7 +125,7 @@ impl std::error::Error for ResolveError {}
 /// `Absolute` entries always attempt resolution regardless of which process
 /// is attached (they might be nonsense if it's the wrong process, but
 /// that's the caller's call to make, not this function's — matches Cheat
-/// Engine's own permissiveness here, see the vault's `v1-plan.md`).
+/// Engine's own permissiveness here, see the vault's `v0.1-plan.md`).
 pub fn resolve_address(
     entry: &CheatEntry,
     session: &ProcessSession,
@@ -247,7 +247,7 @@ impl From<serde_json::Error> for TableError {
 }
 
 /// Saves `entries` to `path` as pretty-printed JSON — diffable and
-/// human-readable, per the vault's `v1-scope.md`, not a new binary format.
+/// human-readable, per the vault's `v0.1-scope.md`, not a new binary format.
 pub fn save_table(path: &Path, entries: &[CheatEntry]) -> Result<(), TableError> {
     let file = File::create(path)?;
     serde_json::to_writer_pretty(BufWriter::new(file), entries)?;
@@ -257,7 +257,7 @@ pub fn save_table(path: &Path, entries: &[CheatEntry]) -> Result<(), TableError>
 /// Loads a previously-saved table. Never resolves addresses itself — that's
 /// [`resolve_address`]'s job, called per-entry once (if) a process is
 /// attached, so a load always succeeds independent of attach state (see the
-/// vault's `v1-plan.md` for why loading while detached, or attached to the
+/// vault's `v0.1-plan.md` for why loading while detached, or attached to the
 /// wrong process, must never silently drop entries).
 pub fn load_table(path: &Path) -> Result<Vec<CheatEntry>, TableError> {
     let file = File::open(path)?;

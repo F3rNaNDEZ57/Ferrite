@@ -22,7 +22,7 @@
 use crate::session::{MemoryError, ProcessSession};
 
 /// Pointer width in the target process. Ferrite targets 64-bit processes
-/// only (see the vault's `v1-scope.md`), so this is always 8 bytes.
+/// only (see the vault's `v0.1-scope.md`), so this is always 8 bytes.
 const POINTER_SIZE: usize = 8;
 
 /// The longest chain accepted from a `.CT` file or a manual-add form. Real

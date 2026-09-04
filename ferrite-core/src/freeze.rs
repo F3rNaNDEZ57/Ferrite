@@ -1,6 +1,6 @@
 //! Freeze: a background thread that repeatedly rewrites a set of addresses,
 //! pinning their values against whatever the target process does to them.
-//! See the concurrency model in the vault's `v1-plan.md`.
+//! See the concurrency model in the vault's `v0.1-plan.md`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};

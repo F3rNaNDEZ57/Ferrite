@@ -1,13 +1,13 @@
 //! Imports a Cheat Engine `.CT` table (plain XML) into our own [`CheatEntry`]
 //! list. Schema verified against real tables and Cheat Engine's own source
-//! (`MemoryRecordUnit.pas`/`CEFuncProc.pas` — see the vault's `v1-plan.md`
+//! (`MemoryRecordUnit.pas`/`CEFuncProc.pas` — see the vault's `v0.1-plan.md`
 //! for the full research), not guessed.
 //!
 //! Entries this can't represent (Lua scripts, structure dissect, bit-field
 //! and custom types, codepage strings, over-deep pointer chains,
 //! unrecognized types, symbol/pointer-expression addresses)
 //! go into a visible [`ImportReport`] rather than being silently dropped or
-//! mis-imported, per the vault's `v1-scope.md`.
+//! mis-imported, per the vault's `v0.1-scope.md`.
 
 use std::path::Path;
 
@@ -94,7 +94,7 @@ struct LastStateXml {
 }
 
 /// One entry that couldn't be imported, with a human-readable reason - the
-/// visible report `v1-scope.md` requires, not just a log line.
+/// visible report `v0.1-scope.md` requires, not just a log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedEntry {
     pub description: String,
@@ -117,7 +117,7 @@ pub struct ImportReport {
     /// real sample tables checked had `Value=""`), so honoring it as-is
     /// would freeze live game memory to a placeholder zero the moment the
     /// table resolves against an attached process. That's a destructive
-    /// default, not a cosmetic one - see the vault's `v1-plan.md`. This list
+    /// default, not a cosmetic one - see the vault's `v0.1-plan.md`. This list
     /// is purely informational, for the caller to surface.
     pub was_active_in_source: Vec<String>,
 }
@@ -286,7 +286,7 @@ fn import_leaf_entry(entry: &CheatEntryXml) -> Result<CheatEntry, String> {
     // technically-parseable module name (e.g. module `"[game.exe"`) that
     // can never resolve - an honest report line beats a perpetual, cryptic
     // "module not found" for an address form v1 was never going to support
-    // anyway. See the vault's `v1-plan.md`.
+    // anyway. See the vault's `v0.1-plan.md`.
     if address_text.contains('[') || address_text.contains(']') {
         return Err(format!(
             "unsupported address expression {address_text:?} (symbol/pointer-expression addressing isn't supported)"
@@ -433,7 +433,7 @@ fn element_flag(value: &Option<String>) -> Option<bool> {
 ///
 /// Authoritative string table from Cheat Engine's own
 /// `VariableTypeToString`/`StringToVariableType` (`CEFuncProc.pas`) - see
-/// the vault's `v1-plan.md`. Unrecognized is always reported, never
+/// the vault's `v0.1-plan.md`. Unrecognized is always reported, never
 /// silently guessed - unlike `StringToVariableType`, which falls back to
 /// `vtByte` for anything it doesn't recognize.
 fn map_variable_type(key: &str, original: &str) -> Result<EntryValue, String> {
@@ -493,7 +493,7 @@ mod tests {
     use crate::table::AddressExpr;
 
     /// These fixtures are synthetic, hand-written to the schema verified in
-    /// this session (see the vault's `v1-plan.md`) - not copies of the real
+    /// this session (see the vault's `v0.1-plan.md`) - not copies of the real
     /// downloaded tables used for that research, which are third-party
     /// files of unclear license and don't belong in this repo.
     fn load_fixture(name: &str) -> String {

@@ -60,7 +60,7 @@ pub struct AobScanResult {
 }
 
 /// A next-scan filter for AOB matches. No Increased/Decreased — meaningless
-/// for a byte pattern, per the vault's `v1-scope.md`.
+/// for a byte pattern, per the vault's `v0.1-scope.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AobFilter {
     Changed,

@@ -1,7 +1,7 @@
 //! Enumerates a process's loaded modules and resolves a module's base
 //! address by name — what `"module.exe"+offset`-style symbolic addressing
 //! (the form nearly every real Cheat Engine table uses, per the vault's
-//! `v1-plan.md`) needs to turn into an absolute address.
+//! `v0.1-plan.md`) needs to turn into an absolute address.
 
 use std::mem::size_of;
 
@@ -42,7 +42,7 @@ impl From<MemoryError> for ModuleError {
 /// exe plus every DLL it has mapped).
 ///
 /// 64-bit modules only (`LIST_MODULES_64BIT`) — v1 targets 64-bit processes
-/// exclusively (see the vault's `v1-scope.md`), and a 32-bit process
+/// exclusively (see the vault's `v0.1-scope.md`), and a 32-bit process
 /// wouldn't attach successfully in the first place.
 pub fn list_modules(session: &ProcessSession) -> Result<Vec<ModuleInfo>, MemoryError> {
     // A generous fixed cap rather than a dynamic two-pass query: real
